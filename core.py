@@ -349,6 +349,9 @@ def generate_greeting(resuming: bool) -> str:
         ],
     )
     return response.choices[0].message.content
+
+
+if __name__ == "__main__":
     # cp1252, the default Windows console encoding, can't represent characters
     # that routinely appear in replies (curly quotes, U+202F).
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
