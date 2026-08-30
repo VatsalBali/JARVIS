@@ -13,16 +13,29 @@ SETUP:
        export GROQ_API_KEY="your-key-here"      (Mac/Linux)
        setx GROQ_API_KEY "your-key-here"         (Windows, new terminal after)
 3. Install deps:      pip install groq
-4. Run this file:     python jarvis_core.py
+4. Run this file:     python core.py
 """
 
 from groq import Groq
 import json
 import os
+import sys
 from datetime import datetime
 
 MODEL = "openai/gpt-oss-120b"
 client = Groq(api_key=os.environ.get("GROQ_API_KEY"))
+
+SYSTEM_PROMPT = (
+    "You are JARVIS, a personal assistant running on the user's own computer. "
+    "Be concise and direct. When a question needs real information about this "
+    "machine, call a tool instead of guessing."
+)
+
+# A directory listing goes into the conversation and is re-sent on every later
+# turn, so an uncapped one (System32 is ~23k tokens) blows the API rate limit.
+MAX_LISTED_FILES = 50
+
+MAX_TOOL_ROUNDS = 5
 
 
 # ---------------------------------------------------------------------------
@@ -39,12 +52,15 @@ def get_current_time() -> str:
 
 def list_files(directory: str = ".") -> str:
     """Lists files in a given directory."""
-    import os
     try:
         files = os.listdir(directory)
-        return json.dumps(files)
     except Exception as e:
         return f"Error: {e}"
+
+    if len(files) > MAX_LISTED_FILES:
+        shown = json.dumps(files[:MAX_LISTED_FILES])
+        return f"{shown}\n(showing {MAX_LISTED_FILES} of {len(files)} entries)"
+    return json.dumps(files)
 
 
 # This is the "menu" we hand to the model, describing each tool so it knows
@@ -86,21 +102,26 @@ AVAILABLE_FUNCTIONS = {
 
 def run_conversation(user_input: str, history: list) -> str:
     """
-    Sends the user's message + history to the model. If the model wants to
-    call a tool, we run it and send the result back for a final answer.
+    Sends the user's message + history to the model. The model may need several
+    rounds of tool calls - each result can prompt the next call - so we keep
+    going until it returns a plain text answer.
     """
     history.append({"role": "user", "content": user_input})
 
-    response = client.chat.completions.create(
-        model=MODEL,
-        messages=history,
-        tools=TOOLS,
-    )
+    for _ in range(MAX_TOOL_ROUNDS):
+        response = client.chat.completions.create(
+            model=MODEL,
+            messages=history,
+            tools=TOOLS,
+        )
 
-    message = response.choices[0].message
+        message = response.choices[0].message
 
-    # Did the model ask to call a tool?
-    if message.tool_calls:
+        # No tool needed - just a normal reply.
+        if not message.tool_calls:
+            history.append({"role": "assistant", "content": message.content})
+            return message.content
+
         # Record the assistant's tool-call request in history. We build this
         # dict manually rather than using message.model_dump() - the full
         # dump includes extra fields (like "annotations") that the API is
@@ -139,21 +160,18 @@ def run_conversation(user_input: str, history: list) -> str:
                 "content": str(result),
             })
 
-        # Ask the model to produce a final natural-language answer now that
-        # it has the tool result in hand.
-        followup = client.chat.completions.create(model=MODEL, messages=history, tools=TOOLS)
-        final_text = followup.choices[0].message.content
-        history.append({"role": "assistant", "content": final_text})
-        return final_text
-
-    # No tool needed - just a normal reply.
-    history.append({"role": "assistant", "content": message.content})
-    return message.content
+    give_up = f"I kept calling tools without reaching an answer ({MAX_TOOL_ROUNDS} rounds). Try asking a narrower question."
+    history.append({"role": "assistant", "content": give_up})
+    return give_up
 
 
 if __name__ == "__main__":
+    # cp1252, the default Windows console encoding, can't represent characters
+    # that routinely appear in replies (curly quotes, U+202F).
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+
     print("JARVIS Day 1 - type 'quit' to exit\n")
-    conversation_history = []
+    conversation_history = [{"role": "system", "content": SYSTEM_PROMPT}]
 
     while True:
         user_text = input("You: ")
