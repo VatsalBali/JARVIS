@@ -35,6 +35,9 @@ SYSTEM_PROMPT = (
 # turn, so an uncapped one (System32 is ~23k tokens) blows the API rate limit.
 MAX_LISTED_FILES = 50
 
+# Same reasoning as MAX_LISTED_FILES, applied to file contents.
+MAX_FILE_CHARS = 4000
+
 MAX_TOOL_ROUNDS = 5
 
 
@@ -61,6 +64,19 @@ def list_files(directory: str = ".") -> str:
         shown = json.dumps(files[:MAX_LISTED_FILES])
         return f"{shown}\n(showing {MAX_LISTED_FILES} of {len(files)} entries)"
     return json.dumps(files)
+
+
+def read_file(path: str) -> str:
+    """Reads and returns the text contents of a file."""
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            content = f.read()
+    except Exception as e:
+        return f"Error: {e}"
+
+    if len(content) > MAX_FILE_CHARS:
+        return f"{content[:MAX_FILE_CHARS]}\n(showing first {MAX_FILE_CHARS} of {len(content)} characters)"
+    return content
 
 
 # This is the "menu" we hand to the model, describing each tool so it knows
@@ -91,12 +107,30 @@ TOOLS = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "read_file",
+            "description": "Read the text contents of a file on the local machine.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "Path to the file to read.",
+                    }
+                },
+                "required": ["path"],
+            },
+        },
+    },
 ]
 
 # Map tool names to actual Python functions so we can execute them by name.
 AVAILABLE_FUNCTIONS = {
     "get_current_time": get_current_time,
     "list_files": list_files,
+    "read_file": read_file,
 }
 
 
