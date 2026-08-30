@@ -1,18 +1,28 @@
 """
-JARVIS - Day 1: Talk to a local LLM (Ollama) with tool calling.
+JARVIS - Day 1: Talk to an LLM (via Groq's free API) with tool calling.
 
-SETUP (run these on YOUR machine, not in a sandbox):
-1. Install Ollama: https://ollama.com/download
-2. Pull a model:      ollama pull llama3.1:8b
-3. Install deps:      pip install ollama
+Why Groq and not a local model: local inference needs a real GPU. With
+integrated graphics only, running even a "small" model on CPU is painfully
+slow. Groq gives free, fast, hosted inference instead - and it's
+OpenAI-compatible, so the code below looks almost identical to what you'd
+write for OpenAI or any other compatible provider.
+
+SETUP:
+1. Get a free API key: https://console.groq.com  (no credit card needed)
+2. Set it as an environment variable so it's never hardcoded in this file:
+       export GROQ_API_KEY="your-key-here"      (Mac/Linux)
+       setx GROQ_API_KEY "your-key-here"         (Windows, new terminal after)
+3. Install deps:      pip install groq
 4. Run this file:     python jarvis_core.py
 """
 
-import ollama
+from groq import Groq
 import json
+import os
 from datetime import datetime
 
-MODEL = "llama3.1:8b"
+MODEL = "openai/gpt-oss-120b"
+client = Groq(api_key=os.environ.get("GROQ_API_KEY"))
 
 
 # ---------------------------------------------------------------------------
@@ -81,41 +91,64 @@ def run_conversation(user_input: str, history: list) -> str:
     """
     history.append({"role": "user", "content": user_input})
 
-    response = ollama.chat(
+    response = client.chat.completions.create(
         model=MODEL,
         messages=history,
         tools=TOOLS,
     )
 
-    message = response["message"]
+    message = response.choices[0].message
 
     # Did the model ask to call a tool?
-    if message.get("tool_calls"):
-        history.append(message)  # record the assistant's tool-call request
+    if message.tool_calls:
+        # Record the assistant's tool-call request in history. We build this
+        # dict manually rather than using message.model_dump() - the full
+        # dump includes extra fields (like "annotations") that the API is
+        # happy to SEND but refuses to RECEIVE back. Only include what the
+        # spec actually requires.
+        history.append({
+            "role": "assistant",
+            "content": message.content,
+            "tool_calls": [
+                {
+                    "id": tc.id,
+                    "type": "function",
+                    "function": {
+                        "name": tc.function.name,
+                        "arguments": tc.function.arguments,
+                    },
+                }
+                for tc in message.tool_calls
+            ],
+        })
 
-        for tool_call in message["tool_calls"]:
-            fn_name = tool_call["function"]["name"]
-            fn_args = tool_call["function"]["arguments"]
+        for tool_call in message.tool_calls:
+            fn_name = tool_call.function.name
+            # Arguments come back as a JSON string, not a dict - must parse.
+            fn_args = json.loads(tool_call.function.arguments)
 
             fn = AVAILABLE_FUNCTIONS.get(fn_name)
             result = fn(**fn_args) if fn else f"Unknown tool: {fn_name}"
 
-            # Feed the tool's result back to the model as a "tool" message
+            # Feed the tool's result back to the model as a "tool" message.
+            # tool_call_id links this result to the specific call above -
+            # required when a model requests multiple tool calls at once.
             history.append({
                 "role": "tool",
+                "tool_call_id": tool_call.id,
                 "content": str(result),
             })
 
         # Ask the model to produce a final natural-language answer now that
         # it has the tool result in hand.
-        followup = ollama.chat(model=MODEL, messages=history, tools=TOOLS)
-        final_text = followup["message"]["content"]
+        followup = client.chat.completions.create(model=MODEL, messages=history, tools=TOOLS)
+        final_text = followup.choices[0].message.content
         history.append({"role": "assistant", "content": final_text})
         return final_text
 
     # No tool needed - just a normal reply.
-    history.append({"role": "assistant", "content": message["content"]})
-    return message["content"]
+    history.append({"role": "assistant", "content": message.content})
+    return message.content
 
 
 if __name__ == "__main__":
