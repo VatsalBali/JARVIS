@@ -20,6 +20,8 @@ from groq import Groq
 import json
 import os
 import sys
+import sqlite3
+import subprocess
 from datetime import datetime
 
 MODEL = "openai/gpt-oss-120b"
@@ -36,6 +38,90 @@ SYSTEM_PROMPT = (
 MAX_LISTED_FILES = 50
 
 MAX_TOOL_ROUNDS = 5
+
+DB_PATH = "jarvis_memory.db"
+
+# How many of the most recent messages we actually SEND to the model each
+# turn. Everything is still saved to disk - this only limits what gets
+# resent on each API call, which is what keeps token usage (and cost/rate
+# limits) from growing unbounded as a conversation gets long.
+MAX_HISTORY_MESSAGES = 20
+
+
+# ---------------------------------------------------------------------------
+# PERSISTENCE: save every message to SQLite so JARVIS remembers past
+# conversations even after the script exits and restarts. This is the
+# "item #5 - conversation memory" piece leveling up from a plain in-RAM list
+# to something durable.
+# ---------------------------------------------------------------------------
+
+def init_db():
+    """Creates the messages table if it doesn't already exist."""
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS messages (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            role TEXT NOT NULL,
+            content TEXT,
+            tool_calls TEXT,
+            tool_call_id TEXT,
+            timestamp TEXT NOT NULL
+        )
+    """)
+    conn.commit()
+    conn.close()
+
+
+def save_message(message: dict):
+    """Appends a single message to the database, exactly as it will be
+    replayed into `history` later."""
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute(
+        "INSERT INTO messages (role, content, tool_calls, tool_call_id, timestamp) "
+        "VALUES (?, ?, ?, ?, ?)",
+        (
+            message.get("role"),
+            message.get("content"),
+            # tool_calls is a list/dict - SQLite only stores text/numbers/blobs,
+            # so we serialize it to a JSON string and deserialize on load.
+            json.dumps(message["tool_calls"]) if message.get("tool_calls") else None,
+            message.get("tool_call_id"),
+            datetime.now().isoformat(),
+        ),
+    )
+    conn.commit()
+    conn.close()
+
+
+def load_recent_history(limit: int = MAX_HISTORY_MESSAGES) -> list:
+    """Loads the most recent `limit` messages from disk, oldest first, so
+    JARVIS picks up roughly where the last session left off."""
+    conn = sqlite3.connect(DB_PATH)
+    rows = conn.execute(
+        "SELECT role, content, tool_calls, tool_call_id FROM messages "
+        "ORDER BY id DESC LIMIT ?",
+        (limit,),
+    ).fetchall()
+    conn.close()
+
+    rows.reverse()  # we fetched newest-first; put back in chronological order
+
+    history = []
+    for role, content, tool_calls_json, tool_call_id in rows:
+        msg = {"role": role, "content": content}
+        if tool_calls_json:
+            msg["tool_calls"] = json.loads(tool_calls_json)
+        if tool_call_id:
+            msg["tool_call_id"] = tool_call_id
+        history.append(msg)
+
+    # Same boundary issue as trim_history: if the LIMIT cut lands right after
+    # an assistant tool_calls message but before its tool response, drop the
+    # orphaned leading tool message(s).
+    while history and history[0]["role"] == "tool":
+        history.pop(0)
+
+    return history
 
 
 # ---------------------------------------------------------------------------
@@ -61,6 +147,25 @@ def list_files(directory: str = ".") -> str:
         shown = json.dumps(files[:MAX_LISTED_FILES])
         return f"{shown}\n(showing {MAX_LISTED_FILES} of {len(files)} entries)"
     return json.dumps(files)
+
+
+def open_file(path: str) -> str:
+    """Opens a file with whatever application is set as the OS default for
+    its type - e.g. a .pdf opens in your PDF viewer, a .docx in Word. This
+    is exactly what happens when you double-click a file in File Explorer."""
+    if not os.path.isfile(path):
+        return f"Error: '{path}' does not exist or is not a file."
+
+    try:
+        if sys.platform == "win32":
+            os.startfile(path)  # Windows-only; launches the default handler
+        elif sys.platform == "darwin":
+            subprocess.run(["open", path], check=True)
+        else:
+            subprocess.run(["xdg-open", path], check=True)
+        return f"Opened '{path}'."
+    except Exception as e:
+        return f"Error opening '{path}': {e}"
 
 
 # This is the "menu" we hand to the model, describing each tool so it knows
@@ -91,13 +196,56 @@ TOOLS = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "open_file",
+            "description": (
+                "Open a file (e.g. PDF, DOCX, image, text file) using the "
+                "operating system's default application for that file type - "
+                "the same as double-clicking it in a file browser."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "Full or relative path to the file to open.",
+                    }
+                },
+                "required": ["path"],
+            },
+        },
+    },
 ]
 
 # Map tool names to actual Python functions so we can execute them by name.
 AVAILABLE_FUNCTIONS = {
     "get_current_time": get_current_time,
     "list_files": list_files,
+    "open_file": open_file,
 }
+
+
+def trim_history(history: list) -> list:
+    """
+    Keeps the system prompt plus only the most recent MAX_HISTORY_MESSAGES
+    messages. Everything is still saved in full to SQLite - this only
+    controls what gets sent to the API each turn, since token usage (and
+    Groq's rate limits) scale with how much history you resend every call.
+    """
+    system_msgs = [m for m in history if m["role"] == "system"]
+    other_msgs = [m for m in history if m["role"] != "system"]
+    trimmed = other_msgs[-MAX_HISTORY_MESSAGES:]
+
+    # A "tool" message only makes sense immediately after the assistant
+    # message that requested it. If the cut landed between them, the API
+    # will reject the orphaned tool message - so drop leading tool messages
+    # until we start on a clean boundary.
+    while trimmed and trimmed[0]["role"] == "tool":
+        trimmed.pop(0)
+
+    return system_msgs + trimmed
 
 
 def run_conversation(user_input: str, history: list) -> str:
@@ -106,7 +254,10 @@ def run_conversation(user_input: str, history: list) -> str:
     rounds of tool calls - each result can prompt the next call - so we keep
     going until it returns a plain text answer.
     """
-    history.append({"role": "user", "content": user_input})
+    history[:] = trim_history(history)
+    user_msg = {"role": "user", "content": user_input}
+    history.append(user_msg)
+    save_message(user_msg)
 
     for _ in range(MAX_TOOL_ROUNDS):
         response = client.chat.completions.create(
@@ -119,7 +270,9 @@ def run_conversation(user_input: str, history: list) -> str:
 
         # No tool needed - just a normal reply.
         if not message.tool_calls:
-            history.append({"role": "assistant", "content": message.content})
+            final_msg = {"role": "assistant", "content": message.content}
+            history.append(final_msg)
+            save_message(final_msg)
             return message.content
 
         # Record the assistant's tool-call request in history. We build this
@@ -127,7 +280,7 @@ def run_conversation(user_input: str, history: list) -> str:
         # dump includes extra fields (like "annotations") that the API is
         # happy to SEND but refuses to RECEIVE back. Only include what the
         # spec actually requires.
-        history.append({
+        tool_call_msg = {
             "role": "assistant",
             "content": message.content,
             "tool_calls": [
@@ -141,7 +294,9 @@ def run_conversation(user_input: str, history: list) -> str:
                 }
                 for tc in message.tool_calls
             ],
-        })
+        }
+        history.append(tool_call_msg)
+        save_message(tool_call_msg)
 
         for tool_call in message.tool_calls:
             fn_name = tool_call.function.name
@@ -154,24 +309,65 @@ def run_conversation(user_input: str, history: list) -> str:
             # Feed the tool's result back to the model as a "tool" message.
             # tool_call_id links this result to the specific call above -
             # required when a model requests multiple tool calls at once.
-            history.append({
+            tool_result_msg = {
                 "role": "tool",
                 "tool_call_id": tool_call.id,
                 "content": str(result),
-            })
+            }
+            history.append(tool_result_msg)
+            save_message(tool_result_msg)
 
     give_up = f"I kept calling tools without reaching an answer ({MAX_TOOL_ROUNDS} rounds). Try asking a narrower question."
-    history.append({"role": "assistant", "content": give_up})
+    give_up_msg = {"role": "assistant", "content": give_up}
+    history.append(give_up_msg)
+    save_message(give_up_msg)
     return give_up
 
 
-if __name__ == "__main__":
+def generate_greeting(resuming: bool) -> str:
+    """
+    One-off, lightweight LLM call for a short greeting - deliberately NOT
+    run through run_conversation/tools, since a greeting never needs a tool
+    and this keeps startup to a single fast API call instead of a full
+    tool-calling round trip.
+    """
+    context = (
+        "This is a fresh start with no prior conversation."
+        if not resuming else
+        "You are resuming a conversation with the user from a previous session."
+    )
+    prompt = (
+        f"The current time is {get_current_time()}. {context} "
+        "Greet the user in one short, natural sentence, JARVIS-style "
+        "(brief, warm but not overly chatty)."
+    )
+    response = client.chat.completions.create(
+        model=MODEL,
+        messages=[
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": prompt},
+        ],
+    )
+    return response.choices[0].message.content
     # cp1252, the default Windows console encoding, can't represent characters
     # that routinely appear in replies (curly quotes, U+202F).
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
-    print("JARVIS Day 1 - type 'quit' to exit\n")
+    init_db()
+
+    print("JARVIS Day 2 - type 'quit' to exit\n")
+
+    # Load whatever's on disk from past sessions, then make sure a system
+    # prompt is present. We DON'T save the system prompt itself each run -
+    # it's re-added fresh here rather than duplicating it in the DB.
     conversation_history = [{"role": "system", "content": SYSTEM_PROMPT}]
+    prior_messages = load_recent_history()
+    if prior_messages:
+        conversation_history.extend(prior_messages)
+
+    greeting = generate_greeting(resuming=bool(prior_messages))
+    print(f"JARVIS: {greeting}\n")
+    conversation_history.append({"role": "assistant", "content": greeting})
 
     while True:
         user_text = input("You: ")
