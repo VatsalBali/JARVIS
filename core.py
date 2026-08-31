@@ -17,6 +17,7 @@ SETUP:
 """
 
 from groq import Groq
+from tavily import TavilyClient
 import json
 import os
 import sys
@@ -317,6 +318,43 @@ def get_system_info() -> str:
     return "\n".join(lines)
 
 
+# Lazily created so a missing TAVILY_API_KEY doesn't crash the whole app on
+# startup - it only becomes a problem the moment web_search is actually
+# called, with a clear error message instead of a startup traceback.
+_tavily_client = None
+
+
+def web_search(query: str) -> str:
+    """Searches the web via Tavily and returns a handful of results with
+    titles, URLs, and short content summaries."""
+    global _tavily_client
+
+    api_key = os.environ.get("TAVILY_API_KEY")
+    if not api_key:
+        return "Error: TAVILY_API_KEY environment variable is not set."
+
+    if _tavily_client is None:
+        _tavily_client = TavilyClient(api_key=api_key)
+
+    try:
+        response = _tavily_client.search(query=query, max_results=5)
+    except Exception as e:
+        return f"Error performing web search: {e}"
+
+    results = response.get("results", [])
+    if not results:
+        return "No results found."
+
+    formatted = []
+    for r in results:
+        title = r.get("title", "Untitled")
+        url = r.get("url", "")
+        content = (r.get("content") or "")[:400]
+        formatted.append(f"{title}\n{url}\n{content}")
+
+    return "\n\n".join(formatted)
+
+
 # This is the "menu" we hand to the model, describing each tool so it knows
 # when and how to call it. This schema format is the same shape used by
 # OpenAI, Anthropic, and Ollama - it's becoming a de facto standard.
@@ -439,6 +477,24 @@ TOOLS = [
             "parameters": {"type": "object", "properties": {}},
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "web_search",
+            "description": (
+                "Search the web for current information - news, facts, prices, "
+                "anything that requires up-to-date or external knowledge you "
+                "wouldn't already know."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "The search query."}
+                },
+                "required": ["query"],
+            },
+        },
+    },
 ]
 
 # Map tool names to actual Python functions so we can execute them by name.
@@ -451,6 +507,7 @@ AVAILABLE_FUNCTIONS = {
     "delete_file": delete_file,
     "create_file": create_file,
     "get_system_info": get_system_info,
+    "web_search": web_search,
 }
 
 
