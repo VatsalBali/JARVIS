@@ -43,6 +43,16 @@ class Api:
         """Called every time the user submits a message in the UI."""
         return core.run_conversation(text, self.history)
 
+    def get_system_stats(self) -> dict:
+        """
+        Called directly by the sidebar's polling loop - deliberately NOT
+        routed through the LLM/tool-calling path. Refreshing a sidebar bar
+        every couple of seconds has nothing to do with conversation, so
+        this calls core's stats function straight, with zero API calls
+        and zero token cost.
+        """
+        return core.get_system_stats_dict()
+
 
 if __name__ == "__main__":
     api = Api()

@@ -23,6 +23,7 @@ import sys
 import sqlite3
 import subprocess
 import shutil
+import psutil
 from datetime import datetime
 
 MODEL = "openai/gpt-oss-120b"
@@ -251,6 +252,71 @@ def create_file(path: str, content: str = "") -> str:
         return f"Error creating '{path}': {e}"
 
 
+def get_system_stats_dict() -> dict:
+    """
+    Returns live system stats as structured data (not a string) - used
+    directly by the UI for the sidebar's live bars, and also as the source
+    of truth behind the get_system_info tool below. Keeping this separate
+    from the tool-facing text version means the UI can poll it every few
+    seconds without spending any LLM tokens or API calls.
+    """
+    cpu_percent = psutil.cpu_percent(interval=0.2)
+    mem = psutil.virtual_memory()
+    disk_path = "C:\\" if sys.platform == "win32" else "/"
+    disk = psutil.disk_usage(disk_path)
+
+    stats = {
+        "cpu_percent": round(cpu_percent, 1),
+        "ram_percent": round(mem.percent, 1),
+        "ram_used_gb": round(mem.used / (1024 ** 3), 1),
+        "ram_total_gb": round(mem.total / (1024 ** 3), 1),
+        "disk_percent": round(disk.percent, 1),
+        "disk_used_gb": round(disk.used / (1024 ** 3), 1),
+        "disk_total_gb": round(disk.total / (1024 ** 3), 1),
+        "gpu": None,
+    }
+
+    # VRAM: only meaningful for a dedicated GPU. GPUtil supports NVIDIA
+    # cards; on integrated-graphics machines (or without GPUtil/no NVIDIA
+    # driver) this will fail, and we deliberately leave "gpu" as None
+    # rather than fabricate a number.
+    try:
+        import GPUtil
+        gpus = GPUtil.getGPUs()
+        if gpus:
+            g = gpus[0]
+            stats["gpu"] = {
+                "name": g.name,
+                "vram_percent": round(g.memoryUtil * 100, 1),
+                "vram_used_mb": round(g.memoryUsed),
+                "vram_total_mb": round(g.memoryTotal),
+            }
+    except Exception:
+        pass
+
+    return stats
+
+
+def get_system_info() -> str:
+    """Tool-facing wrapper: formats live system stats as text for JARVIS
+    to read out or discuss in conversation."""
+    s = get_system_stats_dict()
+    lines = [
+        f"CPU usage: {s['cpu_percent']}%",
+        f"RAM usage: {s['ram_percent']}% ({s['ram_used_gb']} GB of {s['ram_total_gb']} GB)",
+        f"Storage usage: {s['disk_percent']}% ({s['disk_used_gb']} GB of {s['disk_total_gb']} GB)",
+    ]
+    if s["gpu"]:
+        g = s["gpu"]
+        lines.append(
+            f"GPU: {g['name']} - VRAM {g['vram_percent']}% "
+            f"({g['vram_used_mb']} MB of {g['vram_total_mb']} MB)"
+        )
+    else:
+        lines.append("GPU/VRAM: no dedicated GPU detected (integrated graphics).")
+    return "\n".join(lines)
+
+
 # This is the "menu" we hand to the model, describing each tool so it knows
 # when and how to call it. This schema format is the same shape used by
 # OpenAI, Anthropic, and Ollama - it's becoming a de facto standard.
@@ -365,6 +431,14 @@ TOOLS = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_system_info",
+            "description": "Get current system resource usage: CPU, RAM, disk/storage, and GPU/VRAM if available.",
+            "parameters": {"type": "object", "properties": {}},
+        },
+    },
 ]
 
 # Map tool names to actual Python functions so we can execute them by name.
@@ -376,6 +450,7 @@ AVAILABLE_FUNCTIONS = {
     "move_file": move_file,
     "delete_file": delete_file,
     "create_file": create_file,
+    "get_system_info": get_system_info,
 }
 
 

@@ -104,7 +104,7 @@
   /* ============ BODY GRID ============ */
   .body {
     display: grid;
-    grid-template-columns: 230px 1fr 1fr;
+    grid-template-columns: 230px 1fr;
     overflow: hidden;
   }
 
@@ -176,6 +176,13 @@
     height: 100%;
     background: var(--accent);
     box-shadow: 0 0 6px var(--accent-glow);
+    transition: width 0.6s ease;
+  }
+
+  .row-sub {
+    font-size: 9px;
+    color: var(--text-faint);
+    margin-top: 4px;
   }
 
   .sidebar-footer {
@@ -223,51 +230,14 @@
     line-height: 1.6;
   }
 
-  /* ============ HERO / BRIEFING ============ */
-  .briefing {
-    padding: 40px 36px;
-    border-right: 1px solid var(--line);
-    overflow-y: auto;
-  }
-
-  .eyebrow {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-    font-size: 10px;
-    letter-spacing: 2px;
-    color: var(--text-faint);
-    margin-bottom: 20px;
-  }
-
-  .eyebrow::before {
-    content: "";
-    width: 18px;
-    height: 1px;
-    background: var(--text-faint);
-  }
-
-  .briefing h1 {
-    font-size: 34px;
-    font-weight: 600;
-    line-height: 1.25;
-    margin: 0 0 20px;
-  }
-
-  .briefing h1 .accent { color: var(--accent); }
-
-  .briefing p {
-    font-size: 13px;
-    line-height: 1.7;
-    color: var(--text-dim);
-    max-width: 34ch;
-  }
-
-  /* ============ RIGHT COLUMN ============ */
-  .right-col {
+  /* ============ MAIN COLUMN (centered) ============ */
+  .main-col {
     display: grid;
     grid-template-rows: 1fr auto;
     overflow: hidden;
+    max-width: 760px;
+    width: 100%;
+    margin: 0 auto;
   }
 
   .listening-panel {
@@ -301,36 +271,44 @@
   }
 
   .ring {
-    width: 150px;
-    height: 150px;
+    width: 180px;
+    height: 180px;
   }
 
-  .ring .track {
-    fill: none;
-    stroke: var(--line-bright);
-    stroke-width: 1;
-  }
-
-  .ring .sweep {
+  .ring .tri-outline {
     fill: none;
     stroke: var(--accent);
-    stroke-width: 1.5;
-    stroke-dasharray: 70 300;
+    stroke-width: 1.2;
+    opacity: 0.4;
+  }
+
+  .ring .tri-glow {
+    transform-origin: 50px 52px;
+    opacity: 0.45;
+  }
+
+  /* Idle: slow, faint breathing glow. */
+  .ring:not(.thinking) .tri-glow {
+    animation: triIdle 3.6s ease-in-out infinite;
+  }
+
+  /* Thinking: brighter, faster pulse - the one clear "it's working" signal. */
+  .ring.thinking .tri-glow {
+    animation: triThinking 1.1s ease-in-out infinite;
+  }
+  .ring.thinking .tri-outline {
     opacity: 0.7;
-    transform-origin: center;
   }
 
-  .ring .core {
-    fill: var(--accent);
-    filter: drop-shadow(0 0 10px var(--accent-glow));
-    opacity: 0.85;
+  @keyframes triIdle {
+    0%, 100% { opacity: 0.3; }
+    50% { opacity: 0.55; }
   }
 
-  .ring.thinking .sweep { animation: rotate 1.8s linear infinite; }
-  .ring.thinking .core { animation: pulse 0.9s ease-in-out infinite; }
-
-  @keyframes rotate { to { transform: rotate(360deg); } }
-  @keyframes pulse { 0%, 100% { opacity: 0.4; } 50% { opacity: 1; } }
+  @keyframes triThinking {
+    0%, 100% { opacity: 0.5; transform: scale(1); }
+    50% { opacity: 1; transform: scale(1.04); }
+  }
 
   .ring-status {
     font-size: 11px;
@@ -426,6 +404,47 @@
     color: var(--text);
   }
 
+  .entry-content { font-size: 13px; line-height: 1.6; color: var(--text); }
+  .entry-content p { margin: 0 0 10px; }
+  .entry-content p:last-child { margin-bottom: 0; }
+
+  .entry-content ul, .entry-content ol {
+    margin: 0 0 10px;
+    padding-left: 20px;
+  }
+  .entry-content li { margin-bottom: 4px; }
+
+  .entry-content h3, .entry-content h4 {
+    margin: 0 0 8px;
+    color: var(--accent);
+    font-weight: 600;
+  }
+  .entry-content h3 { font-size: 15px; }
+  .entry-content h4 { font-size: 13px; }
+
+  .entry-content .inline-code {
+    background: var(--panel-alt);
+    border: 1px solid var(--line);
+    border-radius: 3px;
+    padding: 1px 5px;
+    font-family: "Consolas", "SF Mono", monospace;
+    font-size: 12px;
+    color: var(--accent);
+  }
+
+  .entry-content .code-block {
+    background: var(--panel-alt);
+    border: 1px solid var(--line);
+    border-radius: 6px;
+    padding: 10px 12px;
+    margin: 0 0 10px;
+    overflow-x: auto;
+    font-family: "Consolas", "SF Mono", monospace;
+    font-size: 12px;
+    color: var(--text);
+    white-space: pre;
+  }
+
   /* ============ QUICK ACTIONS ============ */
   .quick-actions {
     display: flex;
@@ -518,18 +537,25 @@
       <div class="nav-item"><span class="icon">&#128274;</span> Security posture</div>
 
       <div class="subsystems">
-        <div class="section-label">SUBSYSTEMS</div>
+        <div class="section-label">SYSTEM TELEMETRY</div>
         <div class="subsystem-row">
-          <div class="row-top"><span>Core intelligence</span><span class="pct">100%</span></div>
-          <div class="bar-track"><div class="bar-fill" style="width:100%"></div></div>
+          <div class="row-top"><span>CPU</span><span class="pct" id="statCpuPct">--%</span></div>
+          <div class="bar-track"><div class="bar-fill" id="statCpuBar" style="width:0%"></div></div>
         </div>
         <div class="subsystem-row">
-          <div class="row-top"><span>Memory (SQLite)</span><span class="pct">100%</span></div>
-          <div class="bar-track"><div class="bar-fill" style="width:100%"></div></div>
+          <div class="row-top"><span>RAM</span><span class="pct" id="statRamPct">--%</span></div>
+          <div class="bar-track"><div class="bar-fill" id="statRamBar" style="width:0%"></div></div>
+          <div class="row-sub" id="statRamSub"></div>
         </div>
         <div class="subsystem-row">
-          <div class="row-top"><span>System monitoring</span><span class="pct">--</span></div>
-          <div class="bar-track"><div class="bar-fill" style="width:0%; opacity:0.3"></div></div>
+          <div class="row-top"><span>Storage</span><span class="pct" id="statDiskPct">--%</span></div>
+          <div class="bar-track"><div class="bar-fill" id="statDiskBar" style="width:0%"></div></div>
+          <div class="row-sub" id="statDiskSub"></div>
+        </div>
+        <div class="subsystem-row">
+          <div class="row-top"><span>VRAM</span><span class="pct" id="statGpuPct">--</span></div>
+          <div class="bar-track"><div class="bar-fill" id="statGpuBar" style="width:0%; opacity:0.3"></div></div>
+          <div class="row-sub" id="statGpuSub"></div>
         </div>
       </div>
 
@@ -547,23 +573,28 @@
       </div>
     </div>
 
-    <!-- BRIEFING -->
-    <div class="briefing">
-      <div class="eyebrow">SESSION BRIEFING</div>
-      <h1>At your service,<br><span class="accent">as always.</span></h1>
-      <p>A quiet interface for complex things. Issue a command, or let the system surface what matters next.</p>
-    </div>
-
-    <!-- RIGHT COLUMN -->
-    <div class="right-col">
+    <!-- MAIN (centered): listening indicator + chat -->
+    <div class="main-col">
 
       <div class="listening-panel">
         <div class="panel-title"><span class="dot"></span>LISTENING CHANNEL</div>
         <div class="ring-stage">
           <svg class="ring" id="ring" viewBox="0 0 100 100">
-            <circle class="track" cx="50" cy="50" r="42"></circle>
-            <circle class="sweep" cx="50" cy="50" r="42"></circle>
-            <circle class="core" cx="50" cy="50" r="12"></circle>
+            <defs>
+              <radialGradient id="triGlow" cx="50%" cy="58%" r="55%">
+                <stop offset="0%" stop-color="#5fd8e8" stop-opacity="0.95"/>
+                <stop offset="45%" stop-color="#5fd8e8" stop-opacity="0.32"/>
+                <stop offset="100%" stop-color="#5fd8e8" stop-opacity="0"/>
+              </radialGradient>
+              <filter id="triBlur" x="-60%" y="-60%" width="220%" height="220%">
+                <feGaussianBlur stdDeviation="3.5"/>
+              </filter>
+            </defs>
+            <path class="tri-glow"
+              d="M 42.92 31.22 Q 50.00 18.00 57.08 31.22 L 72.92 60.78 Q 80.00 74.00 65.00 74.00 L 35.00 74.00 Q 20.00 74.00 27.08 60.78 Z"
+              fill="url(#triGlow)" filter="url(#triBlur)"></path>
+            <path class="tri-outline"
+              d="M 42.92 31.22 Q 50.00 18.00 57.08 31.22 L 72.92 60.78 Q 80.00 74.00 65.00 74.00 L 35.00 74.00 Q 20.00 74.00 27.08 60.78 Z"></path>
           </svg>
           <div class="ring-status mono" id="ringStatus">READY / AWAITING INPUT</div>
         </div>
@@ -596,6 +627,67 @@
 </div>
 
 <script>
+  // ---------------------------------------------------------------------
+  // Minimal markdown -> HTML renderer for JARVIS's replies. The model
+  // often responds with **bold**, bullet lists, numbered steps, and code
+  // blocks - without this, that all shows up as literal asterisks and
+  // dashes instead of actual formatting.
+  // ---------------------------------------------------------------------
+  function escapeHtml(str) {
+    return str
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;');
+  }
+
+  function renderMarkdown(raw) {
+    // Pull fenced code blocks out FIRST and stash them, so nothing inside
+    // gets mangled by the bold/italic regexes that run afterward.
+    const codeBlocks = [];
+    let text = raw.replace(/```(\w*)\n?([\s\S]*?)```/g, (_, lang, code) => {
+      const idx = codeBlocks.length;
+      codeBlocks.push(code.replace(/\n$/, ''));
+      return `\u0000CODEBLOCK${idx}\u0000`;
+    });
+
+    text = escapeHtml(text);
+
+    text = text.replace(/`([^`]+)`/g, '<code class="inline-code">$1</code>');
+    text = text.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>');
+    text = text.replace(/(?<!\*)\*([^*\n]+)\*(?!\*)/g, '<em>$1</em>');
+
+    const blocks = text.split(/\n{2,}/);
+    return blocks.map(block => {
+      const lines = block.split('\n').filter(l => l.trim() !== '');
+      if (lines.length === 0) return '';
+
+      const codeMatch = block.trim().match(/^\u0000CODEBLOCK(\d+)\u0000$/);
+      if (codeMatch) {
+        const code = codeBlocks[parseInt(codeMatch[1], 10)];
+        return `<pre class="code-block"><code>${escapeHtml(code)}</code></pre>`;
+      }
+
+      if (/^###\s+/.test(lines[0]) && lines.length === 1) {
+        return `<h4>${lines[0].replace(/^###\s+/, '')}</h4>`;
+      }
+      if (/^##\s+/.test(lines[0]) && lines.length === 1) {
+        return `<h3>${lines[0].replace(/^##\s+/, '')}</h3>`;
+      }
+
+      if (lines.every(l => /^[-*•]\s+/.test(l.trim()))) {
+        const items = lines.map(l => `<li>${l.trim().replace(/^[-*•]\s+/, '')}</li>`).join('');
+        return `<ul>${items}</ul>`;
+      }
+
+      if (lines.every(l => /^\d+\.\s+/.test(l.trim()))) {
+        const items = lines.map(l => `<li>${l.trim().replace(/^\d+\.\s+/, '')}</li>`).join('');
+        return `<ol>${items}</ol>`;
+      }
+
+      return `<p>${lines.join('<br>')}</p>`;
+    }).join('');
+  }
+
   const log = document.getElementById('log');
   const input = document.getElementById('input');
   const ring = document.getElementById('ring');
@@ -613,6 +705,43 @@
   }
   tick();
   setInterval(tick, 1000);
+
+  // System telemetry: polls the backend directly (no LLM call involved)
+  // every 3 seconds and updates the sidebar bars.
+  async function refreshStats() {
+    try {
+      const s = await window.pywebview.api.get_system_stats();
+
+      document.getElementById('statCpuPct').textContent = `${s.cpu_percent}%`;
+      document.getElementById('statCpuBar').style.width = `${s.cpu_percent}%`;
+
+      document.getElementById('statRamPct').textContent = `${s.ram_percent}%`;
+      document.getElementById('statRamBar').style.width = `${s.ram_percent}%`;
+      document.getElementById('statRamSub').textContent =
+        `${s.ram_used_gb} GB / ${s.ram_total_gb} GB`;
+
+      document.getElementById('statDiskPct').textContent = `${s.disk_percent}%`;
+      document.getElementById('statDiskBar').style.width = `${s.disk_percent}%`;
+      document.getElementById('statDiskSub').textContent =
+        `${s.disk_used_gb} GB / ${s.disk_total_gb} GB`;
+
+      const gpuBar = document.getElementById('statGpuBar');
+      if (s.gpu) {
+        document.getElementById('statGpuPct').textContent = `${s.gpu.vram_percent}%`;
+        gpuBar.style.width = `${s.gpu.vram_percent}%`;
+        gpuBar.style.opacity = 1;
+        document.getElementById('statGpuSub').textContent =
+          `${s.gpu.name} - ${s.gpu.vram_used_mb} / ${s.gpu.vram_total_mb} MB`;
+      } else {
+        document.getElementById('statGpuPct').textContent = 'N/A';
+        gpuBar.style.width = '0%';
+        gpuBar.style.opacity = 0.3;
+        document.getElementById('statGpuSub').textContent = 'No dedicated GPU detected';
+      }
+    } catch (err) {
+      console.error('Stats refresh failed:', err);
+    }
+  }
 
   function addMessage(role, text) {
     count++;
@@ -640,8 +769,13 @@
     head.appendChild(who);
     head.appendChild(time);
 
-    const p = document.createElement('p');
-    p.textContent = text;
+    const p = document.createElement('div');
+    p.className = 'entry-content';
+    if (role === 'jarvis') {
+      p.innerHTML = renderMarkdown(text);
+    } else {
+      p.textContent = text;
+    }
 
     body.appendChild(head);
     body.appendChild(p);
@@ -687,6 +821,9 @@
     const greeting = await window.pywebview.api.get_greeting();
     setThinking(false);
     addMessage('jarvis', greeting);
+
+    refreshStats();
+    setInterval(refreshStats, 3000);
   });
 </script>
 
