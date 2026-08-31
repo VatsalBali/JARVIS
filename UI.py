@@ -180,7 +180,6 @@ if __name__ == "__main__":
         js_api=api,
         fullscreen=True,   # fills the entire screen
         frameless=True,    # no OS title bar/borders
-        on_top=True,       # stays above other windows if fullscreen is ever exited
         resizable=True,
     )
 
