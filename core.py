@@ -33,7 +33,9 @@ client = Groq(api_key=os.environ.get("GROQ_API_KEY"))
 SYSTEM_PROMPT = (
     "You are JARVIS, a personal assistant running on the user's own computer. "
     "Be concise and direct. When a question needs real information about this "
-    "machine, call a tool instead of guessing."
+    "machine, call a tool instead of guessing. To open an application (like "
+    "Notepad, Chrome, or Spotify), call launch_app directly with the app name - "
+    "do not use list_files or open_file to search for it first."
 )
 
 # A directory listing goes into the conversation and is re-sent on every later
@@ -169,6 +171,102 @@ def open_file(path: str) -> str:
         return f"Opened '{path}'."
     except Exception as e:
         return f"Error opening '{path}': {e}"
+
+
+def _find_start_menu_shortcut(app_name: str):
+    """
+    Searches Windows Start Menu shortcut folders for a .lnk file whose name
+    contains app_name (case-insensitive) - this is essentially what happens
+    when you press the Windows key and type an app's name. Most installed
+    apps (Obsidian included) aren't on PATH at all; they only exist as a
+    shortcut here, which is why a plain PATH-based launch fails for them.
+    Returns the shortcut's full path if found, else None.
+    """
+    search_dirs = []
+    appdata = os.environ.get("APPDATA")
+    programdata = os.environ.get("PROGRAMDATA")
+    if appdata:
+        search_dirs.append(os.path.join(appdata, "Microsoft", "Windows", "Start Menu", "Programs"))
+    if programdata:
+        search_dirs.append(os.path.join(programdata, "Microsoft", "Windows", "Start Menu", "Programs"))
+
+    name_lower = app_name.lower()
+    for base in search_dirs:
+        if not os.path.isdir(base):
+            continue
+        for root, _, files in os.walk(base):
+            for f in files:
+                if f.lower().endswith(".lnk") and name_lower in f.lower():
+                    return os.path.join(root, f)
+    return None
+
+
+def launch_app(app_name: str) -> str:
+    """
+    Launches an application by name (e.g. "notepad", "chrome", "obsidian")
+    WITHOUT searching the general filesystem first. Two strategies, tried
+    in order:
+
+      1. Look for a matching Start Menu shortcut (.lnk) and launch that
+         directly - this covers the vast majority of installed apps, since
+         that's genuinely how Windows itself finds them by name.
+      2. Fall back to letting the shell resolve the name via PATH - this
+         covers built-in commands like "notepad" or "calc" that don't have
+         Start Menu shortcuts but ARE directly runnable.
+
+    Unlike a naive Popen-and-forget, this actually checks whether the
+    launch succeeded: a failing command (like "not recognized") normally
+    exits almost immediately, so we wait briefly and inspect the result
+    instead of always reporting success.
+    """
+    if sys.platform == "win32":
+        shortcut = _find_start_menu_shortcut(app_name)
+        if shortcut:
+            try:
+                os.startfile(shortcut)
+                return f"Launched '{app_name}' (via Start Menu shortcut)."
+            except Exception as e:
+                return f"Error launching '{app_name}': {e}"
+
+        # No shortcut found - fall back to PATH resolution via the shell.
+        try:
+            proc = subprocess.Popen(
+                app_name, shell=True,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            )
+            try:
+                # A command that fails to resolve (like "not recognized")
+                # exits almost instantly. A real GUI app keeps running, so
+                # this timeout is what lets us tell the two apart without
+                # blocking forever on a successful, long-running launch.
+                stdout, stderr = proc.communicate(timeout=1.5)
+                if proc.returncode != 0:
+                    detail = stderr.strip() or stdout.strip() or f"exit code {proc.returncode}"
+                    return (
+                        f"Error launching '{app_name}': {detail}. "
+                        f"No Start Menu shortcut matched this name either - "
+                        f"try the app's exact display name."
+                    )
+                return f"Launched '{app_name}'."
+            except subprocess.TimeoutExpired:
+                # Still running past the timeout - treat as a successful,
+                # ongoing GUI app launch rather than waiting indefinitely.
+                return f"Launched '{app_name}'."
+        except Exception as e:
+            return f"Error launching '{app_name}': {e}"
+
+    elif sys.platform == "darwin":
+        try:
+            subprocess.run(["open", "-a", app_name], check=True)
+            return f"Launched '{app_name}'."
+        except Exception as e:
+            return f"Error launching '{app_name}': {e}"
+    else:
+        try:
+            subprocess.Popen([app_name])
+            return f"Launched '{app_name}'."
+        except Exception as e:
+            return f"Error launching '{app_name}': {e}"
 
 
 # How many characters of extracted file text we hand to the model at once.
@@ -388,9 +486,11 @@ TOOLS = [
         "function": {
             "name": "open_file",
             "description": (
-                "Open a file (e.g. PDF, DOCX, image, text file) using the "
+                "Open a specific FILE (e.g. PDF, DOCX, image, text file) using the "
                 "operating system's default application for that file type - "
-                "the same as double-clicking it in a file browser."
+                "the same as double-clicking it in a file browser. For launching "
+                "an APPLICATION by name (e.g. Notepad, Chrome, Spotify) instead "
+                "of opening a file, use launch_app instead - it's much faster."
             ),
             "parameters": {
                 "type": "object",
@@ -401,6 +501,28 @@ TOOLS = [
                     }
                 },
                 "required": ["path"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "launch_app",
+            "description": (
+                "Launch an application by name (e.g. 'notepad', 'chrome', 'spotify', "
+                "'calculator'). Use this for opening PROGRAMS - it's a single fast "
+                "call. Do NOT use list_files or open_file to hunt for an application's "
+                "executable file first; launch_app resolves common app names directly."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "app_name": {
+                        "type": "string",
+                        "description": "Name of the application to launch, e.g. 'notepad' or 'chrome'.",
+                    }
+                },
+                "required": ["app_name"],
             },
         },
     },
@@ -502,6 +624,7 @@ AVAILABLE_FUNCTIONS = {
     "get_current_time": get_current_time,
     "list_files": list_files,
     "open_file": open_file,
+    "launch_app": launch_app,
     "read_file": read_file,
     "move_file": move_file,
     "delete_file": delete_file,
