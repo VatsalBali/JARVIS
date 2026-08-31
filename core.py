@@ -44,7 +44,26 @@ MAX_LISTED_FILES = 50
 
 MAX_TOOL_ROUNDS = 5
 
-DB_PATH = "jarvis_memory.db"
+def _get_data_dir() -> str:
+    """
+    Returns a proper per-user, writable directory for JARVIS's persistent
+    data (currently just the SQLite DB). A relative path like
+    "jarvis_memory.db" only works reliably when you run `python core.py`
+    by hand from this exact folder - it breaks for a packaged .exe
+    launched via Windows autostart, which often runs with an unexpected
+    working directory (frequently System32). %LOCALAPPDATA%\\JARVIS is
+    the standard place per-user app data belongs on Windows.
+    """
+    if sys.platform == "win32":
+        base = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~")
+    else:
+        base = os.path.expanduser("~/.local/share")
+    data_dir = os.path.join(base, "JARVIS")
+    os.makedirs(data_dir, exist_ok=True)
+    return data_dir
+
+
+DB_PATH = os.path.join(_get_data_dir(), "jarvis_memory.db")
 
 # How many of the most recent messages we actually SEND to the model each
 # turn. Everything is still saved to disk - this only limits what gets
@@ -453,6 +472,37 @@ def web_search(query: str) -> str:
     return "\n\n".join(formatted)
 
 
+# Lazily created for the same reason as the Tavily client - a missing or
+# broken toast library shouldn't crash the whole app at startup, only the
+# one tool that actually needs it.
+_toaster = None
+
+
+def send_notification(title: str, message: str = "") -> str:
+    """
+    Shows a real Windows toast notification (the kind that pops up from
+    the notification area), separate from anything shown in the JARVIS
+    chat window itself - useful for things JARVIS wants to flag even if
+    you're not actively looking at the app.
+    """
+    if sys.platform != "win32":
+        return "Error: toast notifications are only supported on Windows."
+
+    global _toaster
+    try:
+        from windows_toasts import Toast, WindowsToaster
+
+        if _toaster is None:
+            _toaster = WindowsToaster("JARVIS")
+
+        toast = Toast()
+        toast.text_fields = [title, message] if message else [title]
+        _toaster.show_toast(toast)
+        return f"Notification sent: '{title}'"
+    except Exception as e:
+        return f"Error sending notification: {e}"
+
+
 # This is the "menu" we hand to the model, describing each tool so it knows
 # when and how to call it. This schema format is the same shape used by
 # OpenAI, Anthropic, and Ollama - it's becoming a de facto standard.
@@ -617,6 +667,26 @@ TOOLS = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "send_notification",
+            "description": (
+                "Show a real Windows toast/system notification - separate from "
+                "the chat window, visible even if the user isn't looking at "
+                "JARVIS right now. Use this for alerts the user should notice "
+                "even if they're not in the app."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "title": {"type": "string", "description": "Short notification title."},
+                    "message": {"type": "string", "description": "Notification body text. Optional."},
+                },
+                "required": ["title"],
+            },
+        },
+    },
 ]
 
 # Map tool names to actual Python functions so we can execute them by name.
@@ -631,6 +701,7 @@ AVAILABLE_FUNCTIONS = {
     "create_file": create_file,
     "get_system_info": get_system_info,
     "web_search": web_search,
+    "send_notification": send_notification,
 }
 
 

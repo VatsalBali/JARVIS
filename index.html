@@ -91,6 +91,16 @@
     color: var(--text-dim);
   }
 
+  .icon-btn {
+    width: 20px; height: 20px;
+    display: flex; align-items: center; justify-content: center;
+    color: var(--text-faint);
+    font-size: 13px;
+    border-radius: 4px;
+    cursor: pointer;
+  }
+  .icon-btn:hover { background: rgba(255,255,255,0.06); color: var(--text-dim); }
+
   .status-dot {
     width: 6px;
     height: 6px;
@@ -523,6 +533,7 @@
     <div class="topbar-right">
       <span>LOCAL INSTANCE</span>
       <span><span class="status-dot"></span>ONLINE</span>
+      <span class="icon-btn" id="hideBtn" title="Hide to tray">&#8211;</span>
     </div>
   </div>
 
@@ -824,6 +835,11 @@
 
     refreshStats();
     setInterval(refreshStats, 3000);
+  });
+
+  const hideBtn = document.getElementById('hideBtn');
+  hideBtn.addEventListener('click', async () => {
+    try { await window.pywebview.api.hide_window(); } catch (err) { console.error(err); }
   });
 </script>
 

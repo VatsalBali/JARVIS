@@ -2,3 +2,4 @@ __pycache__/
 *.pyc
 jarvis_memory.db
 open_javis.bat
+build.bat
