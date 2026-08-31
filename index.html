@@ -5,14 +5,18 @@
 <title>J.A.R.V.I.S.</title>
 <style>
   :root {
-    --bg: #0a0e17;
-    --panel: #0d1220;
-    --line: #1b2a3a;
-    --line-bright: #2a4356;
-    --accent: #4fd8ff;
-    --accent-dim: #2a6b80;
-    --text: #e8f4ff;
-    --text-dim: #6b8299;
+    --bg: #060a10;
+    --panel: #0b111a;
+    --panel-alt: #0e1520;
+    --line: #1c2733;
+    --line-bright: #2c4353;
+    --accent: #5fd8e8;
+    --accent-dim: #2c5560;
+    --accent-glow: rgba(95, 216, 232, 0.35);
+    --text: #e7f1f5;
+    --text-dim: #6f8794;
+    --text-faint: #3f515c;
+    --warn: #e8b45f;
   }
 
   * { box-sizing: border-box; }
@@ -26,25 +30,64 @@
     overflow: hidden;
   }
 
-  body {
-    display: flex;
-    flex-direction: column;
+  .mono {
+    font-family: "Consolas", "SF Mono", monospace;
   }
 
-  /* --- Header --- */
-  header {
+  /* ============ SHELL ============ */
+  .shell {
+    display: grid;
+    grid-template-rows: auto 1fr;
+    height: 100%;
+  }
+
+  /* ============ TOP BAR ============ */
+  .topbar {
     display: flex;
     align-items: center;
-    gap: 10px;
-    padding: 16px 24px;
+    gap: 12px;
+    padding: 14px 24px;
     border-bottom: 1px solid var(--line);
     flex-shrink: 0;
   }
 
-  .wordmark {
-    font-family: "Consolas", "SF Mono", monospace;
+  .topbar .icon-btn {
+    color: var(--text-dim);
+    font-size: 16px;
+    cursor: default;
+  }
+
+  .brand-mark {
+    width: 30px;
+    height: 30px;
+    border: 1px solid var(--accent-dim);
+    border-radius: 6px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    color: var(--accent);
     font-size: 13px;
-    letter-spacing: 4px;
+  }
+
+  .brand-text .title {
+    font-size: 14px;
+    font-weight: 600;
+    letter-spacing: 1px;
+  }
+
+  .brand-text .subtitle {
+    font-size: 9px;
+    letter-spacing: 2px;
+    color: var(--text-dim);
+  }
+
+  .topbar-right {
+    margin-left: auto;
+    display: flex;
+    align-items: center;
+    gap: 14px;
+    font-size: 10px;
+    letter-spacing: 1.5px;
     color: var(--text-dim);
   }
 
@@ -53,115 +96,372 @@
     height: 6px;
     border-radius: 50%;
     background: var(--accent);
-    box-shadow: 0 0 8px var(--accent);
-    margin-left: auto;
+    box-shadow: 0 0 8px var(--accent-glow);
+    display: inline-block;
+    margin-right: 4px;
   }
 
-  .status-text {
+  /* ============ BODY GRID ============ */
+  .body {
+    display: grid;
+    grid-template-columns: 230px 1fr 1fr;
+    overflow: hidden;
+  }
+
+  /* ============ SIDEBAR ============ */
+  .sidebar {
+    border-right: 1px solid var(--line);
+    padding: 20px 16px;
+    display: flex;
+    flex-direction: column;
+    overflow-y: auto;
+  }
+
+  .section-label {
+    font-size: 10px;
+    letter-spacing: 2px;
+    color: var(--text-faint);
+    margin-bottom: 10px;
+  }
+
+  .nav-item {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 9px 10px;
+    border-radius: 4px;
+    font-size: 13px;
+    color: var(--text-dim);
+    margin-bottom: 2px;
+  }
+
+  .nav-item.active {
+    background: rgba(95, 216, 232, 0.08);
+    border-left: 2px solid var(--accent);
+    color: var(--text);
+  }
+
+  .nav-item .icon { width: 16px; text-align: center; font-size: 12px; }
+
+  .subsystems {
+    margin-top: 28px;
+  }
+
+  .subsystem-row {
+    margin-bottom: 14px;
+  }
+
+  .subsystem-row .row-top {
+    display: flex;
+    justify-content: space-between;
+    font-size: 12px;
+    color: var(--text-dim);
+    margin-bottom: 5px;
+  }
+
+  .subsystem-row .row-top .pct {
+    color: var(--text);
     font-family: "Consolas", "SF Mono", monospace;
     font-size: 11px;
-    color: var(--text-dim);
-    letter-spacing: 2px;
   }
 
-  /* --- Central ring (the one signature animated element) --- */
-  .ring-wrap {
+  .bar-track {
+    height: 3px;
+    background: var(--line);
+    border-radius: 2px;
+    overflow: hidden;
+  }
+
+  .bar-fill {
+    height: 100%;
+    background: var(--accent);
+    box-shadow: 0 0 6px var(--accent-glow);
+  }
+
+  .sidebar-footer {
+    margin-top: auto;
+    padding-top: 18px;
+  }
+
+  .metric-pair {
     display: flex;
+    gap: 14px;
+    margin-bottom: 14px;
+  }
+
+  .metric {
+    flex: 1;
+    background: var(--panel-alt);
+    border: 1px solid var(--line);
+    border-radius: 6px;
+    padding: 10px 12px;
+  }
+
+  .metric .metric-label {
+    font-size: 9px;
+    letter-spacing: 1px;
+    color: var(--text-faint);
+    margin-bottom: 4px;
+  }
+
+  .metric .metric-value {
+    font-family: "Consolas", "SF Mono", monospace;
+    font-size: 15px;
+  }
+
+  .metric .metric-sub {
+    font-size: 9px;
+    color: var(--text-faint);
+    margin-top: 2px;
+  }
+
+  .session-note {
+    font-size: 10px;
+    color: var(--text-faint);
+    border-top: 1px solid var(--line);
+    padding-top: 12px;
+    line-height: 1.6;
+  }
+
+  /* ============ HERO / BRIEFING ============ */
+  .briefing {
+    padding: 40px 36px;
+    border-right: 1px solid var(--line);
+    overflow-y: auto;
+  }
+
+  .eyebrow {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 10px;
+    letter-spacing: 2px;
+    color: var(--text-faint);
+    margin-bottom: 20px;
+  }
+
+  .eyebrow::before {
+    content: "";
+    width: 18px;
+    height: 1px;
+    background: var(--text-faint);
+  }
+
+  .briefing h1 {
+    font-size: 34px;
+    font-weight: 600;
+    line-height: 1.25;
+    margin: 0 0 20px;
+  }
+
+  .briefing h1 .accent { color: var(--accent); }
+
+  .briefing p {
+    font-size: 13px;
+    line-height: 1.7;
+    color: var(--text-dim);
+    max-width: 34ch;
+  }
+
+  /* ============ RIGHT COLUMN ============ */
+  .right-col {
+    display: grid;
+    grid-template-rows: 1fr auto;
+    overflow: hidden;
+  }
+
+  .listening-panel {
+    padding: 22px 28px;
+    border-bottom: 1px solid var(--line);
+    display: flex;
+    flex-direction: column;
+  }
+
+  .panel-title {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 10px;
+    letter-spacing: 2px;
+    color: var(--text-faint);
+  }
+
+  .panel-title .dot {
+    width: 5px; height: 5px; border-radius: 50%;
+    background: var(--accent);
+  }
+
+  .ring-stage {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
     justify-content: center;
-    padding: 28px 0 8px;
-    flex-shrink: 0;
+    gap: 16px;
   }
 
   .ring {
-    width: 64px;
-    height: 64px;
+    width: 150px;
+    height: 150px;
   }
 
-  .ring circle {
+  .ring .track {
     fill: none;
-    stroke: var(--accent-dim);
-    stroke-width: 2;
+    stroke: var(--line-bright);
+    stroke-width: 1;
+  }
+
+  .ring .sweep {
+    fill: none;
+    stroke: var(--accent);
+    stroke-width: 1.5;
+    stroke-dasharray: 70 300;
+    opacity: 0.7;
+    transform-origin: center;
   }
 
   .ring .core {
     fill: var(--accent);
-    opacity: 0.7;
-    transition: opacity 0.3s ease;
+    filter: drop-shadow(0 0 10px var(--accent-glow));
+    opacity: 0.85;
   }
 
-  .ring.thinking .core {
-    animation: pulse 1s ease-in-out infinite;
-  }
+  .ring.thinking .sweep { animation: rotate 1.8s linear infinite; }
+  .ring.thinking .core { animation: pulse 0.9s ease-in-out infinite; }
 
-  .ring.thinking circle {
-    animation: rotate 2.2s linear infinite;
-    stroke-dasharray: 90 130;
-    transform-origin: center;
-  }
+  @keyframes rotate { to { transform: rotate(360deg); } }
+  @keyframes pulse { 0%, 100% { opacity: 0.4; } 50% { opacity: 1; } }
 
-  @keyframes pulse {
-    0%, 100% { opacity: 0.35; }
-    50% { opacity: 1; }
-  }
-
-  @keyframes rotate {
-    to { transform: rotate(360deg); }
-  }
-
-  /* --- Conversation log --- */
-  .log {
-    flex: 1;
-    overflow-y: auto;
-    padding: 20px 32px;
-    display: flex;
-    flex-direction: column;
-    gap: 18px;
-  }
-
-  .msg {
-    max-width: 70%;
-    line-height: 1.5;
-    font-size: 14px;
-  }
-
-  .msg.user {
-    align-self: flex-end;
-    text-align: right;
-    color: var(--text);
-    border-right: 2px solid var(--line-bright);
-    padding-right: 12px;
-  }
-
-  .msg.jarvis {
-    align-self: flex-start;
-    color: var(--accent);
-    border-left: 2px solid var(--accent-dim);
-    padding-left: 12px;
-  }
-
-  .msg .label {
-    display: block;
-    font-family: "Consolas", "SF Mono", monospace;
-    font-size: 10px;
+  .ring-status {
+    font-size: 11px;
     letter-spacing: 2px;
     color: var(--text-dim);
-    margin-bottom: 4px;
   }
 
-  /* --- Input bar --- */
+  .listening-footer {
+    display: flex;
+    justify-content: space-between;
+    font-size: 10px;
+    letter-spacing: 1px;
+    color: var(--text-faint);
+    margin-top: 10px;
+  }
+
+  .listening-footer .ok { color: var(--accent); }
+
+  /* ============ CONVERSATION LOG ============ */
+  .conv-panel {
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+  }
+
+  .conv-header {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 16px 24px;
+    border-bottom: 1px solid var(--line);
+    font-size: 11px;
+    letter-spacing: 1px;
+    color: var(--text-dim);
+    flex-shrink: 0;
+  }
+
+  .conv-header .count { color: var(--text-faint); font-size: 10px; }
+
+  .conv-log {
+    flex: 1;
+    overflow-y: auto;
+    padding: 18px 24px;
+    display: flex;
+    flex-direction: column;
+    gap: 16px;
+  }
+
+  .entry {
+    display: flex;
+    gap: 10px;
+  }
+
+  .avatar {
+    width: 20px;
+    height: 20px;
+    border: 1px solid var(--line-bright);
+    border-radius: 4px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 9px;
+    font-family: "Consolas", "SF Mono", monospace;
+    flex-shrink: 0;
+    margin-top: 1px;
+  }
+
+  .entry.jarvis .avatar { color: var(--accent); border-color: var(--accent-dim); }
+  .entry.user .avatar { color: var(--warn); border-color: #6b5730; }
+
+  .entry-body .entry-head {
+    display: flex;
+    gap: 8px;
+    align-items: baseline;
+    margin-bottom: 3px;
+  }
+
+  .entry-head .who {
+    font-size: 10px;
+    letter-spacing: 1px;
+    font-family: "Consolas", "SF Mono", monospace;
+  }
+
+  .entry.jarvis .who { color: var(--accent); }
+  .entry.user .who { color: var(--warn); }
+
+  .entry-head .time { font-size: 9px; color: var(--text-faint); }
+
+  .entry-body p {
+    margin: 0;
+    font-size: 13px;
+    line-height: 1.6;
+    color: var(--text);
+  }
+
+  /* ============ QUICK ACTIONS ============ */
+  .quick-actions {
+    display: flex;
+    gap: 8px;
+    padding: 12px 24px;
+    border-top: 1px solid var(--line);
+    flex-shrink: 0;
+    flex-wrap: wrap;
+  }
+
+  .chip {
+    background: var(--panel-alt);
+    border: 1px solid var(--line);
+    border-radius: 5px;
+    padding: 6px 12px;
+    font-size: 11px;
+    color: var(--text-dim);
+    cursor: pointer;
+  }
+
+  .chip:hover {
+    border-color: var(--accent-dim);
+    color: var(--text);
+  }
+
+  /* ============ INPUT BAR ============ */
   .input-bar {
     display: flex;
     align-items: center;
-    gap: 12px;
-    padding: 16px 24px;
+    gap: 10px;
+    padding: 14px 24px;
     border-top: 1px solid var(--line);
     flex-shrink: 0;
   }
 
-  .input-bracket {
-    color: var(--accent-dim);
-    font-family: "Consolas", "SF Mono", monospace;
-  }
+  .input-bracket { color: var(--text-faint); font-size: 13px; }
 
   #input {
     flex: 1;
@@ -169,76 +469,195 @@
     border: none;
     outline: none;
     color: var(--text);
-    font-size: 14px;
+    font-size: 13px;
     font-family: inherit;
     padding: 8px 0;
   }
 
-  #input::placeholder {
-    color: var(--text-dim);
+  #input::placeholder { color: var(--text-faint); }
+
+  .input-icon {
+    color: var(--text-faint);
+    font-size: 13px;
+    cursor: default;
   }
 
-  .hint {
-    font-family: "Consolas", "SF Mono", monospace;
-    font-size: 10px;
-    color: var(--text-dim);
-    letter-spacing: 1px;
-  }
+  .input-icon.send { color: var(--accent); cursor: pointer; }
 
-  /* Scrollbar - keep it quiet */
-  .log::-webkit-scrollbar { width: 6px; }
-  .log::-webkit-scrollbar-thumb { background: var(--line-bright); border-radius: 3px; }
-  .log::-webkit-scrollbar-track { background: transparent; }
+  /* Scrollbars */
+  ::-webkit-scrollbar { width: 6px; }
+  ::-webkit-scrollbar-thumb { background: var(--line-bright); border-radius: 3px; }
+  ::-webkit-scrollbar-track { background: transparent; }
 </style>
 </head>
 <body>
 
-  <header>
-    <span class="wordmark">J.A.R.V.I.S.</span>
-    <span class="status-text" id="statusText">ONLINE</span>
-    <span class="status-dot"></span>
-  </header>
+<div class="shell">
 
-  <div class="ring-wrap">
-    <svg class="ring" id="ring" viewBox="0 0 64 64">
-      <circle cx="32" cy="32" r="26"></circle>
-      <circle class="core" cx="32" cy="32" r="6"></circle>
-    </svg>
+  <div class="topbar">
+    <span class="icon-btn">&#9776;</span>
+    <div class="brand-mark">&#9881;</div>
+    <div class="brand-text">
+      <div class="title">J.A.R.V.I.S.</div>
+      <div class="subtitle">PERSONAL COMMAND CONSOLE</div>
+    </div>
+    <div class="topbar-right">
+      <span>LOCAL INSTANCE</span>
+      <span><span class="status-dot"></span>ONLINE</span>
+    </div>
   </div>
 
-  <div class="log" id="log"></div>
+  <div class="body">
 
-  <div class="input-bar">
-    <span class="input-bracket">&gt;</span>
-    <input id="input" type="text" placeholder="Speak, and I shall listen." autofocus>
-    <span class="hint">ENTER</span>
+    <!-- SIDEBAR -->
+    <div class="sidebar">
+      <div class="section-label">NAVIGATION</div>
+      <div class="nav-item active"><span class="icon">&#8862;</span> Command center</div>
+      <div class="nav-item"><span class="icon">&#8767;</span> System telemetry</div>
+      <div class="nav-item"><span class="icon">&#9673;</span> Active channels</div>
+      <div class="nav-item"><span class="icon">&#128274;</span> Security posture</div>
+
+      <div class="subsystems">
+        <div class="section-label">SUBSYSTEMS</div>
+        <div class="subsystem-row">
+          <div class="row-top"><span>Core intelligence</span><span class="pct">100%</span></div>
+          <div class="bar-track"><div class="bar-fill" style="width:100%"></div></div>
+        </div>
+        <div class="subsystem-row">
+          <div class="row-top"><span>Memory (SQLite)</span><span class="pct">100%</span></div>
+          <div class="bar-track"><div class="bar-fill" style="width:100%"></div></div>
+        </div>
+        <div class="subsystem-row">
+          <div class="row-top"><span>System monitoring</span><span class="pct">--</span></div>
+          <div class="bar-track"><div class="bar-fill" style="width:0%; opacity:0.3"></div></div>
+        </div>
+      </div>
+
+      <div class="sidebar-footer">
+        <div class="metric-pair">
+          <div class="metric">
+            <div class="metric-label">LOCAL TIME</div>
+            <div class="metric-value mono" id="clock">--:--:--</div>
+          </div>
+        </div>
+        <div class="session-note">
+          LOCAL SESSION<br>
+          No cloud storage &middot; SQLite on disk
+        </div>
+      </div>
+    </div>
+
+    <!-- BRIEFING -->
+    <div class="briefing">
+      <div class="eyebrow">SESSION BRIEFING</div>
+      <h1>At your service,<br><span class="accent">as always.</span></h1>
+      <p>A quiet interface for complex things. Issue a command, or let the system surface what matters next.</p>
+    </div>
+
+    <!-- RIGHT COLUMN -->
+    <div class="right-col">
+
+      <div class="listening-panel">
+        <div class="panel-title"><span class="dot"></span>LISTENING CHANNEL</div>
+        <div class="ring-stage">
+          <svg class="ring" id="ring" viewBox="0 0 100 100">
+            <circle class="track" cx="50" cy="50" r="42"></circle>
+            <circle class="sweep" cx="50" cy="50" r="42"></circle>
+            <circle class="core" cx="50" cy="50" r="12"></circle>
+          </svg>
+          <div class="ring-status mono" id="ringStatus">READY / AWAITING INPUT</div>
+        </div>
+        <div class="listening-footer">
+          <span>CORE-01</span>
+          <span>STABILITY <span class="ok">OPTIMAL</span></span>
+        </div>
+      </div>
+
+      <div class="conv-panel">
+        <div class="conv-header">
+          <span>&gt;_ CONVERSATION LOG</span>
+          <span class="count" id="entryCount">/ 0 entries</span>
+        </div>
+        <div class="conv-log" id="log"></div>
+        <div class="quick-actions">
+          <div class="chip" data-msg="What's in my Downloads folder?">List my Downloads</div>
+          <div class="chip" data-msg="What time is it?">What time is it?</div>
+          <div class="chip" data-msg="What can you help me with?">What can you do?</div>
+        </div>
+        <div class="input-bar">
+          <span class="input-bracket mono">&gt;</span>
+          <input id="input" type="text" placeholder="Issue a command..." autofocus>
+          <span class="input-icon send" id="sendBtn">&#10148;</span>
+        </div>
+      </div>
+
+    </div>
   </div>
+</div>
 
 <script>
   const log = document.getElementById('log');
   const input = document.getElementById('input');
   const ring = document.getElementById('ring');
-  const statusText = document.getElementById('statusText');
+  const ringStatus = document.getElementById('ringStatus');
+  const entryCount = document.getElementById('entryCount');
+  const sendBtn = document.getElementById('sendBtn');
+  let count = 0;
+
+  function pad(n) { return n.toString().padStart(2, '0'); }
+
+  function tick() {
+    const d = new Date();
+    document.getElementById('clock').textContent =
+      `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
+  }
+  tick();
+  setInterval(tick, 1000);
 
   function addMessage(role, text) {
-    const div = document.createElement('div');
-    div.className = 'msg ' + role;
-    const label = document.createElement('span');
-    label.className = 'label';
-    label.textContent = role === 'user' ? 'YOU' : 'JARVIS';
-    div.appendChild(label);
-    div.appendChild(document.createTextNode(text));
-    log.appendChild(div);
+    count++;
+    entryCount.textContent = `/ ${count} entries`;
+
+    const entry = document.createElement('div');
+    entry.className = 'entry ' + role;
+
+    const avatar = document.createElement('div');
+    avatar.className = 'avatar';
+    avatar.textContent = role === 'user' ? 'Y' : 'J';
+
+    const body = document.createElement('div');
+    body.className = 'entry-body';
+
+    const head = document.createElement('div');
+    head.className = 'entry-head';
+    const who = document.createElement('span');
+    who.className = 'who';
+    who.textContent = role === 'user' ? 'YOU' : 'JARVIS';
+    const time = document.createElement('span');
+    time.className = 'time';
+    const d = new Date();
+    time.textContent = `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
+    head.appendChild(who);
+    head.appendChild(time);
+
+    const p = document.createElement('p');
+    p.textContent = text;
+
+    body.appendChild(head);
+    body.appendChild(p);
+    entry.appendChild(avatar);
+    entry.appendChild(body);
+    log.appendChild(entry);
     log.scrollTop = log.scrollHeight;
   }
 
   function setThinking(isThinking) {
     ring.classList.toggle('thinking', isThinking);
-    statusText.textContent = isThinking ? 'THINKING' : 'ONLINE';
+    ringStatus.textContent = isThinking ? 'PROCESSING...' : 'READY / AWAITING INPUT';
   }
 
-  async function sendMessage() {
-    const text = input.value.trim();
+  async function sendMessage(text) {
+    text = (text !== undefined ? text : input.value).trim();
     if (!text) return;
     input.value = '';
     addMessage('user', text);
@@ -257,8 +676,12 @@
   input.addEventListener('keydown', (e) => {
     if (e.key === 'Enter') sendMessage();
   });
+  sendBtn.addEventListener('click', () => sendMessage());
 
-  // Fetch the startup greeting once pywebview's API bridge is ready.
+  document.querySelectorAll('.chip').forEach(chip => {
+    chip.addEventListener('click', () => sendMessage(chip.dataset.msg));
+  });
+
   window.addEventListener('pywebviewready', async () => {
     setThinking(true);
     const greeting = await window.pywebview.api.get_greeting();
