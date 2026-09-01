@@ -1,0 +1,21 @@
+groq
+tavily-python
+pypdf
+python-docx
+pywebview
+psutil
+windows-toasts
+pystray
+Pillow
+faster-whisper
+sounddevice
+numpy
+piper-tts
+msal
+requests
+google-auth
+google-auth-oauthlib
+
+# Only needed to build the standalone .exe (via build.bat) - not required
+# to just run `python ui.py` during development.
+pyinstaller

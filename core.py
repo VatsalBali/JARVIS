@@ -26,6 +26,13 @@ import subprocess
 import shutil
 import webbrowser
 from urllib.parse import quote_plus
+import msal
+import requests
+import base64
+from email.mime.text import MIMEText
+from google_auth_oauthlib.flow import InstalledAppFlow
+from google.auth.transport.requests import Request as GoogleAuthRequest
+from google.oauth2.credentials import Credentials
 import psutil
 import sounddevice as sd
 import numpy as np
@@ -33,7 +40,7 @@ import threading
 import collections
 import re
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timedelta
 
 MODEL = "openai/gpt-oss-120b"
 client = Groq(api_key=os.environ.get("GROQ_API_KEY"))
@@ -46,7 +53,10 @@ SYSTEM_PROMPT = (
     "your responses, it doesn't pad them out. When a question needs real information "
     "about this machine or the world, call a tool instead of guessing. To open an "
     "application (like Notepad, Chrome, or Spotify), call launch_app directly with the "
-    "app name - do not use list_files or open_file to search for it first."
+    "app name - do not use list_files or open_file to search for it first. For "
+    "non-trivial coding help - writing code, debugging, explaining code, "
+    "architecture questions - use ask_coding_agent to consult a coding "
+    "specialist rather than answering directly yourself."
 )
 
 # Name ORACLE uses when greeting you on wake-word activation.
@@ -486,6 +496,48 @@ def web_search(query: str) -> str:
     return "\n\n".join(formatted)
 
 
+# ---------------------------------------------------------------------------
+# CODING AGENT: a scoped, single-tool version of "an agent for coding" -
+# not a separate multi-agent framework, just ORACLE's main model
+# delegating coding-heavy requests to a coding-specialist model when it
+# judges that's a better fit than answering directly itself. Uses Kimi K2
+# (moonshotai/kimi-k2-instruct), which is on Groq's genuinely free tier
+# and specifically tagged for coding use cases - same client, same API
+# key as everything else, no new account or setup needed.
+# ---------------------------------------------------------------------------
+
+CODING_MODEL = "moonshotai/kimi-k2-instruct"
+CODING_AGENT_SYSTEM_PROMPT = (
+    "You are an expert coding assistant. Provide clean, correct, well-explained "
+    "code and precise technical answers to programming questions. Explain your "
+    "reasoning where it genuinely helps understanding, but don't pad answers with "
+    "unnecessary chatter - the person asking wants a working answer."
+)
+
+
+def ask_coding_agent(prompt: str) -> str:
+    """
+    Delegates a coding-focused question or task to a coding-specialist model
+    (Kimi K2) rather than answering it directly - use this for non-trivial
+    coding help: writing code, debugging, explaining code, architecture
+    questions. Pass the specific coding question/task as the prompt; this
+    doesn't have access to the rest of the conversation, so include
+    whatever context (language, relevant code, error messages) is actually
+    needed to answer well.
+    """
+    try:
+        response = client.chat.completions.create(
+            model=CODING_MODEL,
+            messages=[
+                {"role": "system", "content": CODING_AGENT_SYSTEM_PROMPT},
+                {"role": "user", "content": prompt},
+            ],
+        )
+        return response.choices[0].message.content
+    except Exception as e:
+        return f"Error consulting coding agent: {e}"
+
+
 def open_web_search(query: str) -> str:
     """
     Opens the user's default web browser to a real, visible search results
@@ -845,7 +897,7 @@ def check_for_wake_word() -> bool:
 # window, a voice turn, or both).
 # ---------------------------------------------------------------------------
 
-PIPER_VOICE_NAME = "en_US-lessac-medium"  # solid general-purpose default voice
+PIPER_VOICE_NAME = "en_GB-alan-medium"  # smooth British male voice - fits ORACLE's character
 _piper_voice = None
 
 
@@ -947,6 +999,398 @@ def send_notification(title: str, message: str = "") -> str:
         return f"Notification sent: '{title}'"
     except Exception as e:
         return f"Error sending notification: {e}"
+
+
+# ---------------------------------------------------------------------------
+# OUTLOOK (Microsoft Graph): Mail and Calendar share one login, since
+# Graph is Microsoft's unified API for both. Uses MSAL's "public client"
+# flow - no client secret embedded in the app (unlike Google's typical
+# desktop-app OAuth pattern), which is the more secure option for
+# something distributed as a standalone .exe.
+#
+# SETUP (one-time, on your end - I can't do this part for you):
+#   1. Go to https://portal.azure.com -> Microsoft Entra ID -> App registrations
+#   2. New registration - name it whatever, "Personal" account types is fine
+#   3. No redirect URI needed for the interactive flow used here
+#   4. Copy the "Application (client) ID" and set it as an environment
+#      variable: MS_CLIENT_ID
+#   5. Under "API permissions", add: Mail.ReadWrite, Mail.Send,
+#      Calendars.ReadWrite (delegated permissions, not application)
+#
+# First run opens your browser for a one-time login/consent. After that,
+# the token is cached to disk and silently refreshed - no repeated logins.
+# ---------------------------------------------------------------------------
+
+GRAPH_SCOPES = ["Mail.ReadWrite", "Mail.Send", "Calendars.ReadWrite"]
+GRAPH_BASE = "https://graph.microsoft.com/v1.0"
+
+_msal_app = None
+_token_cache = None
+
+
+def _get_token_cache_path() -> str:
+    return os.path.join(_get_data_dir(), "ms_token_cache.bin")
+
+
+def _get_graph_token() -> str:
+    """
+    Returns a valid Microsoft Graph access token, handling the whole MSAL
+    dance: load any cached session from disk, try to reuse it silently
+    (no user interaction), and only fall back to opening a browser for a
+    fresh login if there's no valid cached session at all.
+    """
+    global _msal_app, _token_cache
+
+    client_id = os.environ.get("MS_CLIENT_ID")
+    if not client_id:
+        raise RuntimeError("MS_CLIENT_ID environment variable is not set.")
+
+    if _token_cache is None:
+        _token_cache = msal.SerializableTokenCache()
+        cache_path = _get_token_cache_path()
+        if os.path.exists(cache_path):
+            with open(cache_path, "r") as f:
+                _token_cache.deserialize(f.read())
+
+    if _msal_app is None:
+        _msal_app = msal.PublicClientApplication(client_id, token_cache=_token_cache)
+
+    result = None
+    accounts = _msal_app.get_accounts()
+    if accounts:
+        result = _msal_app.acquire_token_silent(GRAPH_SCOPES, account=accounts[0])
+
+    if not result:
+        result = _msal_app.acquire_token_interactive(GRAPH_SCOPES)
+
+    if _token_cache.has_state_changed:
+        with open(_get_token_cache_path(), "w") as f:
+            f.write(_token_cache.serialize())
+
+    if "access_token" not in result:
+        error_desc = result.get("error_description", "unknown error")
+        raise RuntimeError(f"Microsoft sign-in failed: {error_desc}")
+
+    return result["access_token"]
+
+
+def _graph_request(method: str, path: str, json_body: dict = None) -> requests.Response:
+    """Thin wrapper around a Graph API call - attaches the bearer token
+    and the base URL so individual tools below don't repeat that setup."""
+    token = _get_graph_token()
+    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+    return requests.request(method, f"{GRAPH_BASE}{path}", headers=headers, json=json_body, timeout=15)
+
+
+def list_recent_emails(count: int = 10) -> str:
+    """Lists the most recent emails in the Outlook inbox."""
+    try:
+        resp = _graph_request(
+            "GET",
+            f"/me/messages?$top={count}&$select=id,subject,from,receivedDateTime,bodyPreview&$orderby=receivedDateTime desc",
+        )
+        resp.raise_for_status()
+    except Exception as e:
+        return f"Error listing emails: {e}"
+
+    messages = resp.json().get("value", [])
+    if not messages:
+        return "No emails found."
+
+    lines = []
+    for m in messages:
+        sender = m.get("from", {}).get("emailAddress", {}).get("address", "unknown sender")
+        lines.append(
+            f"ID: {m['id']}\nFrom: {sender}\nSubject: {m.get('subject', '(no subject)')}\n"
+            f"Received: {m.get('receivedDateTime', '')}\nPreview: {m.get('bodyPreview', '')[:200]}"
+        )
+    return "\n\n".join(lines)
+
+
+def read_email(email_id: str) -> str:
+    """Reads the full content of a specific email by its ID (get the ID
+    from list_recent_emails first)."""
+    try:
+        resp = _graph_request("GET", f"/me/messages/{email_id}?$select=subject,from,body,receivedDateTime")
+        resp.raise_for_status()
+    except Exception as e:
+        return f"Error reading email: {e}"
+
+    m = resp.json()
+    sender = m.get("from", {}).get("emailAddress", {}).get("address", "unknown sender")
+    body = m.get("body", {}).get("content", "")
+    return f"From: {sender}\nSubject: {m.get('subject', '(no subject)')}\n\n{body}"
+
+
+def send_email(to: str, subject: str, body: str) -> str:
+    """Sends an email from the user's Outlook account. This sends
+    immediately - there is no draft/confirmation step."""
+    payload = {
+        "message": {
+            "subject": subject,
+            "body": {"contentType": "Text", "content": body},
+            "toRecipients": [{"emailAddress": {"address": to}}],
+        }
+    }
+    try:
+        resp = _graph_request("POST", "/me/sendMail", json_body=payload)
+        resp.raise_for_status()
+        return f"Email sent to {to}."
+    except Exception as e:
+        return f"Error sending email: {e}"
+
+
+def delete_email(email_id: str) -> str:
+    """Deletes an email by ID. Microsoft moves deleted messages to the
+    Deleted Items folder rather than erasing them immediately, so this is
+    usually recoverable for a while - but treat it as final."""
+    try:
+        resp = _graph_request("DELETE", f"/me/messages/{email_id}")
+        resp.raise_for_status()
+        return f"Deleted email {email_id}."
+    except Exception as e:
+        return f"Error deleting email: {e}"
+
+
+def list_upcoming_events(days: int = 7) -> str:
+    """Lists upcoming Outlook calendar events over the next N days."""
+    start = datetime.utcnow().isoformat() + "Z"
+    end = (datetime.utcnow() + timedelta(days=days)).isoformat() + "Z"
+    try:
+        resp = _graph_request(
+            "GET",
+            f"/me/calendarView?startDateTime={start}&endDateTime={end}"
+            f"&$select=id,subject,start,end,location&$orderby=start/dateTime",
+        )
+        resp.raise_for_status()
+    except Exception as e:
+        return f"Error listing events: {e}"
+
+    events = resp.json().get("value", [])
+    if not events:
+        return f"No events in the next {days} day(s)."
+
+    lines = []
+    for e in events:
+        loc = e.get("location", {}).get("displayName", "")
+        lines.append(
+            f"ID: {e['id']}\n{e.get('subject', '(no subject)')}\n"
+            f"Start: {e.get('start', {}).get('dateTime', '')}\n"
+            f"End: {e.get('end', {}).get('dateTime', '')}" + (f"\nLocation: {loc}" if loc else "")
+        )
+    return "\n\n".join(lines)
+
+
+def create_calendar_event(subject: str, start_iso: str, end_iso: str, attendees: str = "") -> str:
+    """
+    Creates an Outlook calendar event. start_iso/end_iso must be ISO 8601
+    datetimes (e.g. '2026-09-05T14:00:00'). attendees is an optional
+    comma-separated list of email addresses.
+    """
+    payload = {
+        "subject": subject,
+        "start": {"dateTime": start_iso, "timeZone": "UTC"},
+        "end": {"dateTime": end_iso, "timeZone": "UTC"},
+    }
+    if attendees:
+        payload["attendees"] = [
+            {"emailAddress": {"address": addr.strip()}, "type": "required"}
+            for addr in attendees.split(",") if addr.strip()
+        ]
+    try:
+        resp = _graph_request("POST", "/me/events", json_body=payload)
+        resp.raise_for_status()
+        return f"Created event '{subject}'."
+    except Exception as e:
+        return f"Error creating event: {e}"
+
+
+def delete_calendar_event(event_id: str) -> str:
+    """Deletes/cancels an Outlook calendar event by ID. This cannot be
+    undone - attendees (if any) are sent a cancellation."""
+    try:
+        resp = _graph_request("DELETE", f"/me/events/{event_id}")
+        resp.raise_for_status()
+        return f"Deleted event {event_id}."
+    except Exception as e:
+        return f"Error deleting event: {e}"
+
+
+# ---------------------------------------------------------------------------
+# GMAIL: separate OAuth flow from Outlook - Google's, not Microsoft's.
+# Uses google-auth-oauthlib's InstalledAppFlow, which briefly runs a local
+# web server on your machine purely to catch the OAuth redirect after you
+# approve access in your browser - normal for this kind of desktop app
+# flow, nothing stays listening afterward.
+#
+# SETUP (one-time, on your end):
+#   1. Go to https://console.cloud.google.com -> create a project (or
+#      reuse one) -> APIs & Services -> Library -> enable "Gmail API"
+#   2. APIs & Services -> Credentials -> Create Credentials -> OAuth
+#      client ID -> Application type: "Desktop app"
+#   3. Download the resulting JSON file, save it anywhere, and set its
+#      full path as an environment variable: GOOGLE_CLIENT_SECRET_PATH
+#
+# First run opens your browser for a one-time login/consent. After that,
+# the token is cached to disk and silently refreshed.
+#
+# Scope choice: gmail.modify + gmail.send covers everything our tools
+# actually do (read, send, move to trash) without requesting the
+# broader permanent-delete capability our delete_gmail_message doesn't
+# use anyway (it moves to trash, not permanent deletion).
+# ---------------------------------------------------------------------------
+
+GMAIL_SCOPES = [
+    "https://www.googleapis.com/auth/gmail.modify",
+    "https://www.googleapis.com/auth/gmail.send",
+]
+GMAIL_BASE = "https://gmail.googleapis.com/gmail/v1"
+
+_gmail_creds = None
+
+
+def _get_gmail_token_path() -> str:
+    return os.path.join(_get_data_dir(), "gmail_token.json")
+
+
+def _get_gmail_token() -> str:
+    """Same shape as _get_graph_token for Outlook: load a cached session
+    if there is one, refresh it silently if it's expired, and only open a
+    browser for a fresh login if there's no usable cached session at all."""
+    global _gmail_creds
+
+    token_path = _get_gmail_token_path()
+
+    if _gmail_creds is None and os.path.exists(token_path):
+        _gmail_creds = Credentials.from_authorized_user_file(token_path, GMAIL_SCOPES)
+
+    if _gmail_creds and _gmail_creds.expired and _gmail_creds.refresh_token:
+        _gmail_creds.refresh(GoogleAuthRequest())
+
+    if not _gmail_creds or not _gmail_creds.valid:
+        client_secret_path = os.environ.get("GOOGLE_CLIENT_SECRET_PATH")
+        if not client_secret_path:
+            raise RuntimeError("GOOGLE_CLIENT_SECRET_PATH environment variable is not set.")
+        flow = InstalledAppFlow.from_client_secrets_file(client_secret_path, GMAIL_SCOPES)
+        _gmail_creds = flow.run_local_server(port=0)
+
+    with open(token_path, "w") as f:
+        f.write(_gmail_creds.to_json())
+
+    return _gmail_creds.token
+
+
+def _gmail_request(method: str, path: str, params: dict = None, json_body: dict = None) -> requests.Response:
+    token = _get_gmail_token()
+    headers = {"Authorization": f"Bearer {token}"}
+    return requests.request(method, f"{GMAIL_BASE}{path}", headers=headers, params=params, json=json_body, timeout=15)
+
+
+def _b64url_decode(data: str) -> str:
+    padded = data + "=" * (-len(data) % 4)
+    return base64.urlsafe_b64decode(padded).decode("utf-8", errors="replace")
+
+
+def _extract_gmail_body(payload: dict) -> str:
+    """
+    Gmail message bodies aren't a simple text field like Outlook's - they're
+    a MIME structure that can be a single part or nested multipart/alternative
+    parts (e.g. text/plain alongside text/html). This recursively hunts for
+    a text/plain part and base64url-decodes it, since that's the most
+    reliably readable form for ORACLE to work with.
+    """
+    if payload.get("mimeType") == "text/plain" and payload.get("body", {}).get("data"):
+        return _b64url_decode(payload["body"]["data"])
+
+    for part in payload.get("parts") or []:
+        found = _extract_gmail_body(part)
+        if found:
+            return found
+
+    # No text/plain part found anywhere - fall back to whatever's at the
+    # top level, if anything (better than returning nothing).
+    if payload.get("body", {}).get("data"):
+        return _b64url_decode(payload["body"]["data"])
+
+    return ""
+
+
+def list_gmail_messages(count: int = 10) -> str:
+    """Lists the most recent Gmail messages. Slower than Outlook's
+    equivalent by design - Gmail's list endpoint only returns IDs, so
+    this makes one follow-up request per message to get subject/sender."""
+    try:
+        resp = _gmail_request("GET", "/users/me/messages", params={"maxResults": count})
+        resp.raise_for_status()
+    except Exception as e:
+        return f"Error listing Gmail messages: {e}"
+
+    ids = [m["id"] for m in resp.json().get("messages", [])]
+    if not ids:
+        return "No messages found."
+
+    lines = []
+    for msg_id in ids:
+        try:
+            detail_resp = _gmail_request(
+                "GET", f"/users/me/messages/{msg_id}",
+                params={"format": "metadata", "metadataHeaders": ["Subject", "From", "Date"]},
+            )
+            detail_resp.raise_for_status()
+            detail = detail_resp.json()
+        except Exception:
+            continue
+
+        headers = {h["name"]: h["value"] for h in detail.get("payload", {}).get("headers", [])}
+        lines.append(
+            f"ID: {msg_id}\nFrom: {headers.get('From', 'unknown')}\n"
+            f"Subject: {headers.get('Subject', '(no subject)')}\nDate: {headers.get('Date', '')}\n"
+            f"Preview: {detail.get('snippet', '')[:200]}"
+        )
+
+    return "\n\n".join(lines) if lines else "No messages could be retrieved."
+
+
+def read_gmail_message(message_id: str) -> str:
+    """Reads the full content of a specific Gmail message. Get the
+    message's ID from list_gmail_messages first."""
+    try:
+        resp = _gmail_request("GET", f"/users/me/messages/{message_id}", params={"format": "full"})
+        resp.raise_for_status()
+    except Exception as e:
+        return f"Error reading Gmail message: {e}"
+
+    msg = resp.json()
+    headers = {h["name"]: h["value"] for h in msg.get("payload", {}).get("headers", [])}
+    body = _extract_gmail_body(msg.get("payload", {}))
+    return f"From: {headers.get('From', 'unknown')}\nSubject: {headers.get('Subject', '(no subject)')}\n\n{body}"
+
+
+def send_gmail_message(to: str, subject: str, body: str) -> str:
+    """Sends an email from the user's Gmail account. Sends immediately -
+    there is no draft/confirmation step."""
+    message = MIMEText(body)
+    message["to"] = to
+    message["subject"] = subject
+    raw = base64.urlsafe_b64encode(message.as_bytes()).decode("utf-8")
+
+    try:
+        resp = _gmail_request("POST", "/users/me/messages/send", json_body={"raw": raw})
+        resp.raise_for_status()
+        return f"Email sent to {to}."
+    except Exception as e:
+        return f"Error sending email: {e}"
+
+
+def delete_gmail_message(message_id: str) -> str:
+    """Moves a Gmail message to Trash by ID (not permanently deleted -
+    Gmail keeps trashed messages for 30 days before erasing them)."""
+    try:
+        resp = _gmail_request("POST", f"/users/me/messages/{message_id}/trash")
+        resp.raise_for_status()
+        return f"Moved message {message_id} to Trash."
+    except Exception as e:
+        return f"Error deleting Gmail message: {e}"
 
 
 # This is the "menu" we hand to the model, describing each tool so it knows
@@ -1098,6 +1542,29 @@ TOOLS = [
     {
         "type": "function",
         "function": {
+            "name": "ask_coding_agent",
+            "description": (
+                "Consult a coding-specialist model for non-trivial programming help - "
+                "writing code, debugging, explaining code, architecture/design questions. "
+                "Use this instead of answering coding questions yourself when the request "
+                "is more than trivial (a one-line syntax question is fine to answer "
+                "directly; writing/debugging/explaining real code should go through this)."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "prompt": {
+                        "type": "string",
+                        "description": "The coding question or task, including any necessary context (language, relevant code, error messages) since this doesn't see the rest of the conversation.",
+                    }
+                },
+                "required": ["prompt"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "web_search",
             "description": (
                 "Search the web for current information and get results back as text "
@@ -1179,6 +1646,164 @@ TOOLS = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_recent_emails",
+            "description": "List the most recent emails in the user's Outlook inbox.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "count": {"type": "integer", "description": "How many recent emails to list. Defaults to 10."}
+                },
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "read_email",
+            "description": "Read the full content of a specific Outlook email. Get the email's ID from list_recent_emails first.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "email_id": {"type": "string", "description": "The ID of the email to read."}
+                },
+                "required": ["email_id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "send_email",
+            "description": "Send an email from the user's Outlook account. Sends immediately.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "to": {"type": "string", "description": "Recipient email address."},
+                    "subject": {"type": "string", "description": "Email subject line."},
+                    "body": {"type": "string", "description": "Email body text."},
+                },
+                "required": ["to", "subject", "body"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "delete_email",
+            "description": "Delete an Outlook email by ID. Moves it to Deleted Items.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "email_id": {"type": "string", "description": "The ID of the email to delete."}
+                },
+                "required": ["email_id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_upcoming_events",
+            "description": "List upcoming events on the user's Outlook calendar.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "days": {"type": "integer", "description": "How many days ahead to look. Defaults to 7."}
+                },
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "create_calendar_event",
+            "description": "Create a new event on the user's Outlook calendar.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "subject": {"type": "string", "description": "Event title."},
+                    "start_iso": {"type": "string", "description": "Start time in ISO 8601 format, e.g. '2026-09-05T14:00:00'."},
+                    "end_iso": {"type": "string", "description": "End time in ISO 8601 format."},
+                    "attendees": {"type": "string", "description": "Optional comma-separated list of attendee email addresses."},
+                },
+                "required": ["subject", "start_iso", "end_iso"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "delete_calendar_event",
+            "description": "Delete/cancel an Outlook calendar event by ID. Cannot be undone.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "event_id": {"type": "string", "description": "The ID of the event to delete."}
+                },
+                "required": ["event_id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_gmail_messages",
+            "description": "List the most recent messages in the user's Gmail inbox (separate from Outlook - use this specifically for Gmail).",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "count": {"type": "integer", "description": "How many recent messages to list. Defaults to 10."}
+                },
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "read_gmail_message",
+            "description": "Read the full content of a specific Gmail message. Get the message's ID from list_gmail_messages first.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "message_id": {"type": "string", "description": "The ID of the message to read."}
+                },
+                "required": ["message_id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "send_gmail_message",
+            "description": "Send an email from the user's Gmail account. Sends immediately.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "to": {"type": "string", "description": "Recipient email address."},
+                    "subject": {"type": "string", "description": "Email subject line."},
+                    "body": {"type": "string", "description": "Email body text."},
+                },
+                "required": ["to", "subject", "body"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "delete_gmail_message",
+            "description": "Move a Gmail message to Trash by ID (recoverable for 30 days, not permanent).",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "message_id": {"type": "string", "description": "The ID of the message to delete."}
+                },
+                "required": ["message_id"],
+            },
+        },
+    },
 ]
 
 # Map tool names to actual Python functions so we can execute them by name.
@@ -1192,10 +1817,22 @@ AVAILABLE_FUNCTIONS = {
     "delete_file": delete_file,
     "create_file": create_file,
     "get_system_info": get_system_info,
+    "ask_coding_agent": ask_coding_agent,
     "web_search": web_search,
     "open_web_search": open_web_search,
     "open_url": open_url,
     "send_notification": send_notification,
+    "list_recent_emails": list_recent_emails,
+    "read_email": read_email,
+    "send_email": send_email,
+    "delete_email": delete_email,
+    "list_upcoming_events": list_upcoming_events,
+    "create_calendar_event": create_calendar_event,
+    "delete_calendar_event": delete_calendar_event,
+    "list_gmail_messages": list_gmail_messages,
+    "read_gmail_message": read_gmail_message,
+    "send_gmail_message": send_gmail_message,
+    "delete_gmail_message": delete_gmail_message,
 }
 
 
@@ -1343,4 +1980,4 @@ if __name__ == "__main__":
         if user_text.lower() in ("quit", "exit"):
             break
         reply = run_conversation(user_text, conversation_history)
-        print(f"ORACLE: {reply}\n")
+        print(f"ORACLE: {reply}\n") 

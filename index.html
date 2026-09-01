@@ -177,153 +177,6 @@
     color: var(--text-dim);
   }
 
-  /* ============ CONVERSATION LOG ============ */
-  .conv-panel {
-    display: flex;
-    flex-direction: column;
-    overflow: hidden;
-  }
-
-  .conv-log {
-    flex: 1;
-    overflow-y: auto;
-    padding: 18px 24px;
-    display: flex;
-    flex-direction: column;
-    gap: 16px;
-  }
-
-  .entry {
-    display: flex;
-    gap: 10px;
-  }
-
-  .avatar {
-    width: 20px;
-    height: 20px;
-    border: 1px solid var(--line-bright);
-    border-radius: 4px;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    font-size: 9px;
-    font-family: "Consolas", "SF Mono", monospace;
-    flex-shrink: 0;
-    margin-top: 1px;
-  }
-
-  .entry.jarvis .avatar { color: var(--accent); border-color: var(--accent-dim); }
-  .entry.user .avatar { color: var(--warn); border-color: #6b5730; }
-
-  .entry-body .entry-head {
-    display: flex;
-    gap: 8px;
-    align-items: baseline;
-    margin-bottom: 3px;
-  }
-
-  .entry-head .who {
-    font-size: 10px;
-    letter-spacing: 1px;
-    font-family: "Consolas", "SF Mono", monospace;
-  }
-
-  .entry.jarvis .who { color: var(--accent); }
-  .entry.user .who { color: var(--warn); }
-
-  .entry-head .time { font-size: 9px; color: var(--text-faint); }
-
-  .entry-body p {
-    margin: 0;
-    font-size: 13px;
-    line-height: 1.6;
-    color: var(--text);
-  }
-
-  .entry-content { font-size: 13px; line-height: 1.6; color: var(--text); }
-  .entry-content p { margin: 0 0 10px; }
-  .entry-content p:last-child { margin-bottom: 0; }
-
-  .entry-content ul, .entry-content ol {
-    margin: 0 0 10px;
-    padding-left: 20px;
-  }
-  .entry-content li { margin-bottom: 4px; }
-
-  .entry-content h3, .entry-content h4 {
-    margin: 0 0 8px;
-    color: var(--accent);
-    font-weight: 600;
-  }
-  .entry-content h3 { font-size: 15px; }
-  .entry-content h4 { font-size: 13px; }
-
-  .entry-content .inline-code {
-    background: var(--panel-alt);
-    border: 1px solid var(--line);
-    border-radius: 3px;
-    padding: 1px 5px;
-    font-family: "Consolas", "SF Mono", monospace;
-    font-size: 12px;
-    color: var(--accent);
-  }
-
-  .entry-content .code-block {
-    background: var(--panel-alt);
-    border: 1px solid var(--line);
-    border-radius: 6px;
-    padding: 10px 12px;
-    margin: 0 0 10px;
-    overflow-x: auto;
-    font-family: "Consolas", "SF Mono", monospace;
-    font-size: 12px;
-    color: var(--text);
-    white-space: pre;
-  }
-
-  /* ============ INPUT BAR ============ */
-  .input-bar {
-    display: flex;
-    align-items: center;
-    gap: 10px;
-    padding: 14px 24px;
-    border-top: 1px solid var(--line);
-    flex-shrink: 0;
-  }
-
-  .input-bracket { color: var(--text-faint); font-size: 13px; }
-
-  #input {
-    flex: 1;
-    background: transparent;
-    border: none;
-    outline: none;
-    color: var(--text);
-    font-size: 13px;
-    font-family: inherit;
-    padding: 8px 0;
-  }
-
-  #input::placeholder { color: var(--text-faint); }
-
-  .input-icon {
-    color: var(--text-faint);
-    font-size: 13px;
-    cursor: default;
-  }
-
-  .input-icon.send { color: var(--accent); cursor: pointer; }
-
-  .input-icon.mic { cursor: pointer; }
-  .input-icon.mic.recording {
-    color: #e85f5f;
-    animation: micPulse 1s ease-in-out infinite;
-  }
-  @keyframes micPulse {
-    0%, 100% { opacity: 0.6; }
-    50% { opacity: 1; }
-  }
-
   /* Scrollbars */
   ::-webkit-scrollbar { width: 6px; }
   ::-webkit-scrollbar-thumb { background: var(--line-bright); border-radius: 3px; }
@@ -336,6 +189,7 @@
 
   <div class="topbar">
     <span class="clock mono" id="clock">--:--:--</span>
+    <span class="icon-btn" id="chatBtn" title="Open chat">&#128172;</span>
     <span class="icon-btn" id="hideBtn" title="Hide to tray">&#8211;</span>
   </div>
 
@@ -448,88 +302,11 @@
         </div>
       </div>
 
-      <div class="conv-panel">
-        <div class="conv-log" id="log"></div>
-        <div class="input-bar">
-          <span class="input-bracket mono">&gt;</span>
-          <input id="input" type="text" placeholder="Issue a command..." autofocus>
-          <span class="input-icon mic" id="micBtn" title="Voice input">&#127908;</span>
-          <span class="input-icon send" id="sendBtn">&#10148;</span>
-        </div>
-      </div>
-
     </div>
   </div>
 </div>
 
 <script>
-  // ---------------------------------------------------------------------
-  // Minimal markdown -> HTML renderer for JARVIS's replies. The model
-  // often responds with **bold**, bullet lists, numbered steps, and code
-  // blocks - without this, that all shows up as literal asterisks and
-  // dashes instead of actual formatting.
-  // ---------------------------------------------------------------------
-  function escapeHtml(str) {
-    return str
-      .replace(/&/g, '&amp;')
-      .replace(/</g, '&lt;')
-      .replace(/>/g, '&gt;');
-  }
-
-  function renderMarkdown(raw) {
-    // Pull fenced code blocks out FIRST and stash them, so nothing inside
-    // gets mangled by the bold/italic regexes that run afterward.
-    const codeBlocks = [];
-    let text = raw.replace(/```(\w*)\n?([\s\S]*?)```/g, (_, lang, code) => {
-      const idx = codeBlocks.length;
-      codeBlocks.push(code.replace(/\n$/, ''));
-      return `\u0000CODEBLOCK${idx}\u0000`;
-    });
-
-    text = escapeHtml(text);
-
-    text = text.replace(/`([^`]+)`/g, '<code class="inline-code">$1</code>');
-    text = text.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>');
-    text = text.replace(/(?<!\*)\*([^*\n]+)\*(?!\*)/g, '<em>$1</em>');
-
-    const blocks = text.split(/\n{2,}/);
-    return blocks.map(block => {
-      const lines = block.split('\n').filter(l => l.trim() !== '');
-      if (lines.length === 0) return '';
-
-      const codeMatch = block.trim().match(/^\u0000CODEBLOCK(\d+)\u0000$/);
-      if (codeMatch) {
-        const code = codeBlocks[parseInt(codeMatch[1], 10)];
-        return `<pre class="code-block"><code>${escapeHtml(code)}</code></pre>`;
-      }
-
-      if (/^###\s+/.test(lines[0]) && lines.length === 1) {
-        return `<h4>${lines[0].replace(/^###\s+/, '')}</h4>`;
-      }
-      if (/^##\s+/.test(lines[0]) && lines.length === 1) {
-        return `<h3>${lines[0].replace(/^##\s+/, '')}</h3>`;
-      }
-
-      if (lines.every(l => /^[-*•]\s+/.test(l.trim()))) {
-        const items = lines.map(l => `<li>${l.trim().replace(/^[-*•]\s+/, '')}</li>`).join('');
-        return `<ul>${items}</ul>`;
-      }
-
-      if (lines.every(l => /^\d+\.\s+/.test(l.trim()))) {
-        const items = lines.map(l => `<li>${l.trim().replace(/^\d+\.\s+/, '')}</li>`).join('');
-        return `<ol>${items}</ol>`;
-      }
-
-      return `<p>${lines.join('<br>')}</p>`;
-    }).join('');
-  }
-
-  const log = document.getElementById('log');
-  const input = document.getElementById('input');
-  const ring = document.getElementById('ring');
-  const ringStatus = document.getElementById('ringStatus');
-  const sendBtn = document.getElementById('sendBtn');
-
   function pad(n) { return n.toString().padStart(2, '0'); }
 
   function tick() {
@@ -540,106 +317,14 @@
   tick();
   setInterval(tick, 1000);
 
-  function addMessage(role, text) {
-    const entry = document.createElement('div');
-    entry.className = 'entry ' + role;
+  // The ring and ring-status themselves are updated from Python (ui.py's
+  // _run_js calls) during wake-word activation - this window has no
+  // conversation logic of its own anymore, just the HUD visual and two
+  // buttons to control the separate chat window / tray visibility.
 
-    const avatar = document.createElement('div');
-    avatar.className = 'avatar';
-    avatar.textContent = role === 'user' ? 'Y' : 'O';
-
-    const body = document.createElement('div');
-    body.className = 'entry-body';
-
-    const head = document.createElement('div');
-    head.className = 'entry-head';
-    const who = document.createElement('span');
-    who.className = 'who';
-    who.textContent = role === 'user' ? 'YOU' : 'ORACLE';
-    const time = document.createElement('span');
-    time.className = 'time';
-    const d = new Date();
-    time.textContent = `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
-    head.appendChild(who);
-    head.appendChild(time);
-
-    const p = document.createElement('div');
-    p.className = 'entry-content';
-    if (role === 'jarvis') {
-      p.innerHTML = renderMarkdown(text);
-    } else {
-      p.textContent = text;
-    }
-
-    body.appendChild(head);
-    body.appendChild(p);
-    entry.appendChild(avatar);
-    entry.appendChild(body);
-    log.appendChild(entry);
-    log.scrollTop = log.scrollHeight;
-  }
-
-  function setThinking(isThinking) {
-    ring.classList.toggle('thinking', isThinking);
-    ringStatus.textContent = isThinking ? 'PROCESSING...' : 'READY / AWAITING INPUT';
-  }
-
-  async function sendMessage(text) {
-    text = (text !== undefined ? text : input.value).trim();
-    if (!text) return;
-    input.value = '';
-    addMessage('user', text);
-    setThinking(true);
-    try {
-      const reply = await window.pywebview.api.send_message(text);
-      addMessage('jarvis', reply);
-    } catch (err) {
-      addMessage('jarvis', 'I encountered an error: ' + err);
-    } finally {
-      setThinking(false);
-      input.focus();
-    }
-  }
-
-  input.addEventListener('keydown', (e) => {
-    if (e.key === 'Enter') sendMessage();
-  });
-  sendBtn.addEventListener('click', () => sendMessage());
-
-  const micBtn = document.getElementById('micBtn');
-  let isRecording = false;
-
-  micBtn.addEventListener('click', async () => {
-    if (!isRecording) {
-      isRecording = true;
-      micBtn.classList.add('recording');
-      ringStatus.textContent = 'LISTENING...';
-      try {
-        await window.pywebview.api.start_recording();
-      } catch (err) {
-        console.error('start_recording failed:', err);
-        isRecording = false;
-        micBtn.classList.remove('recording');
-        ringStatus.textContent = 'READY / AWAITING INPUT';
-      }
-    } else {
-      isRecording = false;
-      micBtn.classList.remove('recording');
-      ringStatus.textContent = 'TRANSCRIBING...';
-      try {
-        const text = await window.pywebview.api.stop_recording();
-        if (text && !text.startsWith('Error:')) {
-          input.value = text;
-          input.focus();
-        } else if (text) {
-          console.warn('Transcription issue:', text);
-        }
-      } catch (err) {
-        console.error('stop_recording failed:', err);
-      } finally {
-        ringStatus.textContent = 'READY / AWAITING INPUT';
-      }
-    }
+  const chatBtn = document.getElementById('chatBtn');
+  chatBtn.addEventListener('click', async () => {
+    try { await window.pywebview.api.show_chat_window(); } catch (err) { console.error(err); }
   });
 
   const hideBtn = document.getElementById('hideBtn');

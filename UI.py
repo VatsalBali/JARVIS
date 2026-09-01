@@ -1,27 +1,29 @@
 """
 ORACLE - Background Desktop App
 
-Runs fullscreen and borderless (no OS title bar), covering the whole
-screen with the dashboard UI. Closing it (the "-" button in the top
-right) just hides it to the system tray; ORACLE keeps running in the
-background until you explicitly Quit from the tray menu.
+Two separate windows now:
+  - The HUD (index.html): fullscreen, borderless, shows the status ring.
+    Activated by the wake word ("Oracle") - listens, replies, and SPEAKS
+    the reply out loud.
+  - The Chat window (chat.html): a normal-sized window you open via the
+    chat icon in the HUD's top bar. Typed (or mic-dictated-then-edited)
+    conversations here stay TEXT-ONLY - ORACLE never speaks a reply to
+    something you typed, since you're already looking at the screen.
 
-Activation is wake-word based: say "Oracle" and it listens for whatever
-you say next (see core.py's WAKE_WORD section for how this works and its
-CPU trade-offs). There is no manual hotkey anymore - voice is the only
-hands-free trigger, alongside the on-screen mic button and text input.
+Both windows hide to the tray rather than closing outright; ORACLE keeps
+running in the background until you explicitly Quit from the tray menu.
 
 Note: true window transparency was attempted but dropped - Windows'
 WebView2 engine has ongoing, unresolved bugs rendering transparent
 windows correctly (confirmed via multiple open upstream issues as of
-2026), so this uses a solid opaque background instead.
+2026), so both windows use a solid opaque background instead.
 
 SETUP:
     pip install -r requirements.txt
     python ui.py
 
 Look for the ORACLE icon in your system tray (may be under the "^" hidden
-icons arrow) to show/hide the window or quit for real.
+icons arrow) to show/hide the HUD or quit for real.
 """
 
 import threading
@@ -36,7 +38,8 @@ import core
 
 # Module-level references so the wake-word thread, tray thread, and Api
 # bridge can all reach the same window/api objects.
-_window = None
+_hud_window = None
+_chat_window = None
 _api = None
 
 
@@ -76,8 +79,6 @@ def _ensure_autostart():
             winreg.KEY_SET_VALUE | winreg.KEY_READ,
         )
 
-        # Clean up a leftover entry from before the JARVIS -> ORACLE rename,
-        # if one exists from an earlier build.
         try:
             winreg.DeleteValue(key, "JARVIS")
         except FileNotFoundError:
@@ -96,12 +97,11 @@ def _ensure_autostart():
 
 class Api:
     """
-    Bridge between index.html's JS and core.py's conversation logic - see
-    core.py for the actual tool-calling / LLM logic. hide_window lets the
-    dashboard's own "-" button hide the window to the tray, in addition
-    to the tray menu's Hide option. There is no startup greeting anymore -
-    ORACLE only greets you when the wake word activates it (see
-    _wake_turn below).
+    Bridge between both windows' JS and core.py's conversation logic.
+    send_message is called only from the chat window and deliberately
+    does NOT speak the reply - voice output is reserved for the wake-word
+    flow (_wake_turn below), which runs entirely in Python and speaks
+    directly, bypassing this bridge.
     """
 
     def __init__(self):
@@ -112,12 +112,7 @@ class Api:
             self.history.extend(prior)
 
     def send_message(self, text: str) -> str:
-        reply = core.run_conversation(text, self.history)
-        # Speak in the background rather than blocking this return - the
-        # reply text should appear in chat immediately, with audio playing
-        # alongside it, not only after playback finishes.
-        threading.Thread(target=core.speak, args=(reply,), daemon=True).start()
-        return reply
+        return core.run_conversation(text, self.history)
 
     def get_system_stats(self) -> dict:
         return core.get_system_stats_dict()
@@ -129,64 +124,83 @@ class Api:
         return core.stop_recording_and_transcribe()
 
     def hide_window(self):
-        if _window:
-            _window.hide()
+        """Hides the HUD window - called by the HUD's own "-" button."""
+        if _hud_window:
+            _hud_window.hide()
+
+    def show_chat_window(self):
+        """Shows the chat window - called by the HUD's chat-icon button."""
+        if _chat_window:
+            _chat_window.show()
+
+    def hide_chat_window(self):
+        """Hides the chat window - called by the chat window's own "-" button."""
+        if _chat_window:
+            _chat_window.hide()
 
 
-def _run_js(script: str):
-    """
-    Runs JS in the already-loaded page - this is how Python pushes updates
-    to the UI on its own initiative (window.evaluate_js), as opposed to
-    the normal flow where JS calls into Python and waits for a return
-    value. Needed here because wake-word activation happens from a
-    background thread, not from a click inside the page.
-    """
-    if _window:
+def _run_js_hud(script: str):
+    """Pushes JS into the HUD window from Python's own initiative - used
+    during wake-word activation, which happens on a background thread
+    with no click involved."""
+    if _hud_window:
         try:
-            _window.evaluate_js(script)
+            _hud_window.evaluate_js(script)
         except Exception as e:
-            print(f"evaluate_js failed: {e}")
+            print(f"evaluate_js (HUD) failed: {e}")
+
+
+def _run_js_chat(script: str):
+    """Same as _run_js_hud, but for the chat window - used to log the
+    wake-word conversation into the chat transcript even when that window
+    isn't currently visible, so the history is there if you open it later."""
+    if _chat_window:
+        try:
+            _chat_window.evaluate_js(script)
+        except Exception as e:
+            print(f"evaluate_js (chat) failed: {e}")
 
 
 def _wake_turn():
     """
-    The full wake-word-triggered interaction: show the window if it was
-    hidden, greet the user (varied each time, via core.generate_wake_greeting),
-    then immediately listen for their actual command, transcribe it, get
-    ORACLE's reply, and push everything into the visible chat log.
+    The full wake-word-triggered interaction: show the HUD if it was
+    hidden, greet the user (varied each time), listen for their command,
+    transcribe it, get ORACLE's reply - speaking both the greeting and
+    the reply out loud - while also logging the exchange into the chat
+    window's transcript (without forcing that window to open).
     """
-    if _window:
-        _window.show()
+    if _hud_window:
+        _hud_window.show()
 
-    _run_js("document.getElementById('ringStatus').textContent = 'ACTIVATED';")
+    _run_js_hud("document.getElementById('ringStatus').textContent = 'ACTIVATED';")
 
     greeting = core.generate_wake_greeting()
     _api.history.append({"role": "assistant", "content": greeting})
-    _run_js(f"addMessage('jarvis', {json.dumps(greeting)});")
+    _run_js_chat(f"addMessage('jarvis', {json.dumps(greeting)});")
     core.speak(greeting)
 
-    _run_js("document.getElementById('ringStatus').textContent = 'LISTENING...';")
-    _run_js("document.getElementById('ring').classList.add('thinking');")
+    _run_js_hud("document.getElementById('ringStatus').textContent = 'LISTENING...';")
+    _run_js_hud("document.getElementById('ring').classList.add('thinking');")
 
     text = core.listen_and_transcribe()
 
     if not text or text.startswith("Error"):
         print(f"Wake turn ended without a usable command: {text}")
-        _run_js("document.getElementById('ring').classList.remove('thinking');")
-        _run_js("document.getElementById('ringStatus').textContent = 'READY / AWAITING INPUT';")
+        _run_js_hud("document.getElementById('ring').classList.remove('thinking');")
+        _run_js_hud("document.getElementById('ringStatus').textContent = 'READY / AWAITING INPUT';")
         return
 
-    _run_js(f"addMessage('user', {json.dumps(text)});")
-    _run_js("document.getElementById('ringStatus').textContent = 'THINKING...';")
+    _run_js_chat(f"addMessage('user', {json.dumps(text)});")
+    _run_js_hud("document.getElementById('ringStatus').textContent = 'THINKING...';")
 
     reply = core.run_conversation(text, _api.history)
 
-    _run_js(f"addMessage('jarvis', {json.dumps(reply)});")
-    _run_js("document.getElementById('ringStatus').textContent = 'SPEAKING...';")
+    _run_js_chat(f"addMessage('jarvis', {json.dumps(reply)});")
+    _run_js_hud("document.getElementById('ringStatus').textContent = 'SPEAKING...';")
     core.speak(reply)
 
-    _run_js("document.getElementById('ring').classList.remove('thinking');")
-    _run_js("document.getElementById('ringStatus').textContent = 'READY / AWAITING INPUT';")
+    _run_js_hud("document.getElementById('ring').classList.remove('thinking');")
+    _run_js_hud("document.getElementById('ringStatus').textContent = 'READY / AWAITING INPUT';")
 
 
 def run_wake_word_listener():
@@ -194,8 +208,8 @@ def run_wake_word_listener():
     Runs on its own daemon thread. Starts the continuous background
     microphone stream, then periodically checks it for the wake word.
     While an actual voice turn is being handled, the wake-word stream is
-    stopped (see _wake_turn's caller below) so the two don't fight over
-    the microphone and so old buffered audio can't immediately re-trigger.
+    stopped so the two don't fight over the microphone and so old
+    buffered audio can't immediately re-trigger.
     """
     core.start_wake_word_stream()
     try:
@@ -211,23 +225,26 @@ def run_wake_word_listener():
         print(f"Wake word listener crashed: {e}")
 
 
-def on_closing():
+def on_hud_closing():
     """
-    Intercepts the window's close event. Returning False here cancels the
-    actual close (this is a pywebview-specific convention - confirmed by
-    reading pywebview's own source: a closing-event handler that returns
-    False sets should_cancel=True internally). We hide instead, so ORACLE
-    keeps running with just the tray icon left.
+    Intercepts the HUD window's close event. Returning False cancels the
+    actual close (confirmed via pywebview's own source: a closing-event
+    handler that returns False sets should_cancel=True internally) - we
+    hide instead, so ORACLE keeps running with just the tray icon left.
     """
-    _window.hide()
+    _hud_window.hide()
+    return False
+
+
+def on_chat_closing():
+    """Same idea as on_hud_closing, for the chat window."""
+    _chat_window.hide()
     return False
 
 
 def _make_tray_image():
-    """
-    Draws a simple glowing-ring icon in memory - no external .ico/.png
-    file needed, keeping the project self-contained.
-    """
+    """Draws a simple glowing-ring icon in memory - no external .ico/.png
+    file needed, keeping the project self-contained."""
     img = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
     draw = ImageDraw.Draw(img)
     draw.ellipse((6, 6, 58, 58), outline=(95, 216, 232, 255), width=5)
@@ -236,26 +253,30 @@ def _make_tray_image():
 
 
 def _tray_show(icon, item):
-    if _window:
-        _window.show()
+    if _hud_window:
+        _hud_window.show()
 
 
 def _tray_hide(icon, item):
-    if _window:
-        _window.hide()
+    if _hud_window:
+        _hud_window.hide()
 
 
 def _tray_quit(icon, item):
     icon.stop()
-    if _window:
-        _window.destroy()
+    if _chat_window:
+        _chat_window.destroy()
+    if _hud_window:
+        _hud_window.destroy()
 
 
 def run_tray():
     """
     Runs the system tray icon's event loop. This must run on its own
     thread since webview.start() below blocks the main thread for its
-    own event loop - two GUI loops can't share one thread.
+    own event loop - two GUI loops can't share one thread. Tray Show/Hide
+    controls the HUD only; the chat window has its own open/hide controls
+    (the HUD's chat icon, and the chat window's own "-" button).
     """
     icon = pystray.Icon(
         "oracle",
@@ -276,7 +297,7 @@ if __name__ == "__main__":
     api = Api()
     _api = api
 
-    _window = webview.create_window(
+    _hud_window = webview.create_window(
         "ORACLE",
         resource_path("index.html"),
         js_api=api,
@@ -284,8 +305,22 @@ if __name__ == "__main__":
         frameless=True,    # no OS title bar/borders
         resizable=True,
     )
+    _hud_window.events.closing += on_hud_closing
 
-    _window.events.closing += on_closing
+    _chat_window = webview.create_window(
+        "ORACLE - Chat",
+        resource_path("chat.html"),
+        js_api=api,
+        width=420,
+        height=640,
+        min_size=(320, 400),
+        frameless=True,
+        easy_drag=True,   # not fullscreen, so unlike the HUD this one benefits
+                           # from being draggable to reposition it
+        resizable=True,
+        hidden=True,       # starts closed - opened via the HUD's chat icon
+    )
+    _chat_window.events.closing += on_chat_closing
 
     tray_thread = threading.Thread(target=run_tray, daemon=True)
     tray_thread.start()
@@ -293,4 +328,4 @@ if __name__ == "__main__":
     wake_thread = threading.Thread(target=run_wake_word_listener, daemon=True)
     wake_thread.start()
 
-    webview.start()c
+    webview.start()

@@ -1,0 +1,411 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>ORACLE - Chat</title>
+<style>
+  :root {
+    --bg: #060a10;
+    --panel: #0b111a;
+    --panel-alt: #0e1520;
+    --line: #1c2733;
+    --line-bright: #2c4353;
+    --accent: #5fd8e8;
+    --accent-dim: #2c5560;
+    --accent-glow: rgba(95, 216, 232, 0.35);
+    --text: #e7f1f5;
+    --text-dim: #6f8794;
+    --text-faint: #3f515c;
+    --warn: #e8b45f;
+  }
+
+  * { box-sizing: border-box; }
+
+  html, body {
+    margin: 0;
+    height: 100%;
+    background: var(--bg);
+    color: var(--text);
+    font-family: -apple-system, "Segoe UI", system-ui, sans-serif;
+    overflow: hidden;
+  }
+
+  .mono { font-family: "Consolas", "SF Mono", monospace; }
+
+  .shell {
+    display: grid;
+    grid-template-rows: auto 1fr auto;
+    height: 100%;
+  }
+
+  /* ============ TOP BAR ============ */
+  .topbar {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    padding: 14px 20px;
+    border-bottom: 1px solid var(--line);
+    flex-shrink: 0;
+  }
+
+  .topbar .title {
+    font-size: 11px;
+    letter-spacing: 2px;
+    color: var(--text-dim);
+  }
+
+  .mic-status {
+    font-size: 10px;
+    letter-spacing: 1px;
+    color: var(--text-faint);
+    margin-left: auto;
+  }
+
+  .icon-btn {
+    width: 20px; height: 20px;
+    display: flex; align-items: center; justify-content: center;
+    color: var(--text-faint);
+    font-size: 13px;
+    border-radius: 4px;
+    cursor: pointer;
+  }
+  .icon-btn:hover { background: rgba(255,255,255,0.06); color: var(--text-dim); }
+
+  /* ============ CONVERSATION LOG ============ */
+  .conv-log {
+    overflow-y: auto;
+    padding: 18px 20px;
+    display: flex;
+    flex-direction: column;
+    gap: 16px;
+  }
+
+  .entry { display: flex; gap: 10px; }
+
+  .avatar {
+    width: 20px;
+    height: 20px;
+    border: 1px solid var(--line-bright);
+    border-radius: 4px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 9px;
+    font-family: "Consolas", "SF Mono", monospace;
+    flex-shrink: 0;
+    margin-top: 1px;
+  }
+
+  .entry.jarvis .avatar { color: var(--accent); border-color: var(--accent-dim); }
+  .entry.user .avatar { color: var(--warn); border-color: #6b5730; }
+
+  .entry-body .entry-head {
+    display: flex;
+    gap: 8px;
+    align-items: baseline;
+    margin-bottom: 3px;
+  }
+
+  .entry-head .who {
+    font-size: 10px;
+    letter-spacing: 1px;
+    font-family: "Consolas", "SF Mono", monospace;
+  }
+
+  .entry.jarvis .who { color: var(--accent); }
+  .entry.user .who { color: var(--warn); }
+
+  .entry-head .time { font-size: 9px; color: var(--text-faint); }
+
+  .entry-content { font-size: 13px; line-height: 1.6; color: var(--text); }
+  .entry-content p { margin: 0 0 10px; }
+  .entry-content p:last-child { margin-bottom: 0; }
+
+  .entry-content ul, .entry-content ol {
+    margin: 0 0 10px;
+    padding-left: 20px;
+  }
+  .entry-content li { margin-bottom: 4px; }
+
+  .entry-content h3, .entry-content h4 {
+    margin: 0 0 8px;
+    color: var(--accent);
+    font-weight: 600;
+  }
+  .entry-content h3 { font-size: 15px; }
+  .entry-content h4 { font-size: 13px; }
+
+  .entry-content .inline-code {
+    background: var(--panel-alt);
+    border: 1px solid var(--line);
+    border-radius: 3px;
+    padding: 1px 5px;
+    font-family: "Consolas", "SF Mono", monospace;
+    font-size: 12px;
+    color: var(--accent);
+  }
+
+  .entry-content .code-block {
+    background: var(--panel-alt);
+    border: 1px solid var(--line);
+    border-radius: 6px;
+    padding: 10px 12px;
+    margin: 0 0 10px;
+    overflow-x: auto;
+    font-family: "Consolas", "SF Mono", monospace;
+    font-size: 12px;
+    color: var(--text);
+    white-space: pre;
+  }
+
+  /* ============ INPUT BAR ============ */
+  .input-bar {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 14px 20px;
+    border-top: 1px solid var(--line);
+    flex-shrink: 0;
+  }
+
+  .input-bracket { color: var(--text-faint); font-size: 13px; }
+
+  #input {
+    flex: 1;
+    background: transparent;
+    border: none;
+    outline: none;
+    color: var(--text);
+    font-size: 13px;
+    font-family: inherit;
+    padding: 8px 0;
+  }
+
+  #input::placeholder { color: var(--text-faint); }
+
+  .input-icon {
+    color: var(--text-faint);
+    font-size: 13px;
+    cursor: default;
+  }
+
+  .input-icon.send { color: var(--accent); cursor: pointer; }
+
+  .input-icon.mic { cursor: pointer; }
+  .input-icon.mic.recording {
+    color: #e85f5f;
+    animation: micPulse 1s ease-in-out infinite;
+  }
+  @keyframes micPulse {
+    0%, 100% { opacity: 0.6; }
+    50% { opacity: 1; }
+  }
+
+  /* Scrollbars */
+  ::-webkit-scrollbar { width: 6px; }
+  ::-webkit-scrollbar-thumb { background: var(--line-bright); border-radius: 3px; }
+  ::-webkit-scrollbar-track { background: transparent; }
+</style>
+</head>
+<body>
+
+<div class="shell">
+
+  <div class="topbar">
+    <span class="title mono">ORACLE &mdash; CHAT</span>
+    <span class="mic-status mono" id="micStatus"></span>
+    <span class="icon-btn" id="chatHideBtn" title="Hide">&#8211;</span>
+  </div>
+
+  <div class="conv-log" id="log"></div>
+
+  <div class="input-bar">
+    <span class="input-bracket mono">&gt;</span>
+    <input id="input" type="text" placeholder="Type a message..." autofocus>
+    <span class="input-icon mic" id="micBtn" title="Voice input">&#127908;</span>
+    <span class="input-icon send" id="sendBtn">&#10148;</span>
+  </div>
+
+</div>
+
+<script>
+  // ---------------------------------------------------------------------
+  // Minimal markdown -> HTML renderer for ORACLE's replies. The model
+  // often responds with **bold**, bullet lists, numbered steps, and code
+  // blocks - without this, that all shows up as literal asterisks and
+  // dashes instead of actual formatting.
+  // ---------------------------------------------------------------------
+  function escapeHtml(str) {
+    return str
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;');
+  }
+
+  function renderMarkdown(raw) {
+    const codeBlocks = [];
+    let text = raw.replace(/```(\w*)\n?([\s\S]*?)```/g, (_, lang, code) => {
+      const idx = codeBlocks.length;
+      codeBlocks.push(code.replace(/\n$/, ''));
+      return `\u0000CODEBLOCK${idx}\u0000`;
+    });
+
+    text = escapeHtml(text);
+
+    text = text.replace(/`([^`]+)`/g, '<code class="inline-code">$1</code>');
+    text = text.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>');
+    text = text.replace(/(?<!\*)\*([^*\n]+)\*(?!\*)/g, '<em>$1</em>');
+
+    const blocks = text.split(/\n{2,}/);
+    return blocks.map(block => {
+      const lines = block.split('\n').filter(l => l.trim() !== '');
+      if (lines.length === 0) return '';
+
+      const codeMatch = block.trim().match(/^\u0000CODEBLOCK(\d+)\u0000$/);
+      if (codeMatch) {
+        const code = codeBlocks[parseInt(codeMatch[1], 10)];
+        return `<pre class="code-block"><code>${escapeHtml(code)}</code></pre>`;
+      }
+
+      if (/^###\s+/.test(lines[0]) && lines.length === 1) {
+        return `<h4>${lines[0].replace(/^###\s+/, '')}</h4>`;
+      }
+      if (/^##\s+/.test(lines[0]) && lines.length === 1) {
+        return `<h3>${lines[0].replace(/^##\s+/, '')}</h3>`;
+      }
+
+      if (lines.every(l => /^[-*•]\s+/.test(l.trim()))) {
+        const items = lines.map(l => `<li>${l.trim().replace(/^[-*•]\s+/, '')}</li>`).join('');
+        return `<ul>${items}</ul>`;
+      }
+
+      if (lines.every(l => /^\d+\.\s+/.test(l.trim()))) {
+        const items = lines.map(l => `<li>${l.trim().replace(/^\d+\.\s+/, '')}</li>`).join('');
+        return `<ol>${items}</ol>`;
+      }
+
+      return `<p>${lines.join('<br>')}</p>`;
+    }).join('');
+  }
+
+  const log = document.getElementById('log');
+  const input = document.getElementById('input');
+  const sendBtn = document.getElementById('sendBtn');
+  const micStatus = document.getElementById('micStatus');
+
+  function pad(n) { return n.toString().padStart(2, '0'); }
+
+  function addMessage(role, text) {
+    const entry = document.createElement('div');
+    entry.className = 'entry ' + role;
+
+    const avatar = document.createElement('div');
+    avatar.className = 'avatar';
+    avatar.textContent = role === 'user' ? 'Y' : 'O';
+
+    const body = document.createElement('div');
+    body.className = 'entry-body';
+
+    const head = document.createElement('div');
+    head.className = 'entry-head';
+    const who = document.createElement('span');
+    who.className = 'who';
+    who.textContent = role === 'user' ? 'YOU' : 'ORACLE';
+    const time = document.createElement('span');
+    time.className = 'time';
+    const d = new Date();
+    time.textContent = `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
+    head.appendChild(who);
+    head.appendChild(time);
+
+    const contentEl = document.createElement('div');
+    contentEl.className = 'entry-content';
+    if (role === 'jarvis') {
+      contentEl.innerHTML = renderMarkdown(text);
+    } else {
+      contentEl.textContent = text;
+    }
+
+    body.appendChild(head);
+    body.appendChild(contentEl);
+    entry.appendChild(avatar);
+    entry.appendChild(body);
+    log.appendChild(entry);
+    log.scrollTop = log.scrollHeight;
+  }
+
+  function setBusy(isBusy) {
+    input.disabled = isBusy;
+    sendBtn.style.opacity = isBusy ? 0.4 : 1;
+    micStatus.textContent = isBusy ? 'THINKING...' : '';
+  }
+
+  // Note: this never triggers speech. Typed/chat-window conversations stay
+  // text-only on purpose - only the wake-word voice flow (driven from
+  // ui.py's _wake_turn, into the separate HUD window) speaks out loud.
+  async function sendMessage(text) {
+    text = (text !== undefined ? text : input.value).trim();
+    if (!text) return;
+    input.value = '';
+    addMessage('user', text);
+    setBusy(true);
+    try {
+      const reply = await window.pywebview.api.send_message(text);
+      addMessage('jarvis', reply);
+    } catch (err) {
+      addMessage('jarvis', 'I encountered an error: ' + err);
+    } finally {
+      setBusy(false);
+      input.focus();
+    }
+  }
+
+  input.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') sendMessage();
+  });
+  sendBtn.addEventListener('click', () => sendMessage());
+
+  const micBtn = document.getElementById('micBtn');
+  let isRecording = false;
+
+  micBtn.addEventListener('click', async () => {
+    if (!isRecording) {
+      isRecording = true;
+      micBtn.classList.add('recording');
+      micStatus.textContent = 'LISTENING...';
+      try {
+        await window.pywebview.api.start_recording();
+      } catch (err) {
+        console.error('start_recording failed:', err);
+        isRecording = false;
+        micBtn.classList.remove('recording');
+        micStatus.textContent = '';
+      }
+    } else {
+      isRecording = false;
+      micBtn.classList.remove('recording');
+      micStatus.textContent = 'TRANSCRIBING...';
+      try {
+        const text = await window.pywebview.api.stop_recording();
+        if (text && !text.startsWith('Error:')) {
+          input.value = text;
+          input.focus();
+        } else if (text) {
+          console.warn('Transcription issue:', text);
+        }
+      } catch (err) {
+        console.error('stop_recording failed:', err);
+      } finally {
+        micStatus.textContent = '';
+      }
+    }
+  });
+
+  const chatHideBtn = document.getElementById('chatHideBtn');
+  chatHideBtn.addEventListener('click', async () => {
+    try { await window.pywebview.api.hide_chat_window(); } catch (err) { console.error(err); }
+  });
+</script>
+
+</body>
+</html>
