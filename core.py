@@ -1,5 +1,5 @@
 """
-JARVIS - Day 1: Talk to an LLM (via Groq's free API) with tool calling.
+ORACLE - Day 1: Talk to an LLM (via Groq's free API) with tool calling.
 
 Why Groq and not a local model: local inference needs a real GPU. With
 integrated graphics only, running even a "small" model on CPU is painfully
@@ -24,14 +24,22 @@ import sys
 import sqlite3
 import subprocess
 import shutil
+import webbrowser
+from urllib.parse import quote_plus
 import psutil
+import sounddevice as sd
+import numpy as np
+import threading
+import collections
+import re
+from pathlib import Path
 from datetime import datetime
 
 MODEL = "openai/gpt-oss-120b"
 client = Groq(api_key=os.environ.get("GROQ_API_KEY"))
 
 SYSTEM_PROMPT = (
-    "You are JARVIS, a personal AI assistant in the spirit of the one from Iron Man: "
+    "You are ORACLE, a personal AI assistant in the spirit of JARVIS from Iron Man: "
     "calm, dry-witted, quietly loyal, and understated rather than effusive. A touch of "
     "wit is welcome where it fits naturally, but never at the expense of being direct "
     "and efficient when the user actually needs something done - personality seasons "
@@ -41,6 +49,9 @@ SYSTEM_PROMPT = (
     "app name - do not use list_files or open_file to search for it first."
 )
 
+# Name ORACLE uses when greeting you on wake-word activation.
+USER_NAME = "Oracle"
+
 # A directory listing goes into the conversation and is re-sent on every later
 # turn, so an uncapped one (System32 is ~23k tokens) blows the API rate limit.
 MAX_LISTED_FILES = 50
@@ -49,24 +60,24 @@ MAX_TOOL_ROUNDS = 5
 
 def _get_data_dir() -> str:
     """
-    Returns a proper per-user, writable directory for JARVIS's persistent
+    Returns a proper per-user, writable directory for ORACLE.s persistent
     data (currently just the SQLite DB). A relative path like
-    "jarvis_memory.db" only works reliably when you run `python core.py`
+    "oracle_memory.db" only works reliably when you run `python core.py`
     by hand from this exact folder - it breaks for a packaged .exe
     launched via Windows autostart, which often runs with an unexpected
-    working directory (frequently System32). %LOCALAPPDATA%\\JARVIS is
+    working directory (frequently System32). %LOCALAPPDATA%\\ORACLE is
     the standard place per-user app data belongs on Windows.
     """
     if sys.platform == "win32":
         base = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~")
     else:
         base = os.path.expanduser("~/.local/share")
-    data_dir = os.path.join(base, "JARVIS")
+    data_dir = os.path.join(base, "ORACLE")
     os.makedirs(data_dir, exist_ok=True)
     return data_dir
 
 
-DB_PATH = os.path.join(_get_data_dir(), "jarvis_memory.db")
+DB_PATH = os.path.join(_get_data_dir(), "oracle_memory.db")
 
 # How many of the most recent messages we actually SEND to the model each
 # turn. Everything is still saved to disk - this only limits what gets
@@ -76,7 +87,7 @@ MAX_HISTORY_MESSAGES = 20
 
 
 # ---------------------------------------------------------------------------
-# PERSISTENCE: save every message to SQLite so JARVIS remembers past
+# PERSISTENCE: save every message to SQLite so ORACLE remembers past
 # conversations even after the script exits and restarts. This is the
 # "item #5 - conversation memory" piece leveling up from a plain in-RAM list
 # to something durable.
@@ -122,7 +133,7 @@ def save_message(message: dict):
 
 def load_recent_history(limit: int = MAX_HISTORY_MESSAGES) -> list:
     """Loads the most recent `limit` messages from disk, oldest first, so
-    JARVIS picks up roughly where the last session left off."""
+    ORACLE picks up roughly where the last session left off."""
     conn = sqlite3.connect(DB_PATH)
     rows = conn.execute(
         "SELECT role, content, tool_calls, tool_call_id FROM messages "
@@ -298,7 +309,7 @@ MAX_FILE_CHARS = 6000
 
 
 def read_file(path: str) -> str:
-    """Extracts and returns text content from a file so JARVIS can summarize
+    """Extracts and returns text content from a file so ORACLE can summarize
     it or answer questions about it. Supports .txt/.md, .pdf, and .docx -
     the format is picked automatically from the file extension."""
     if not os.path.isfile(path):
@@ -419,7 +430,7 @@ def get_system_stats_dict() -> dict:
 
 
 def get_system_info() -> str:
-    """Tool-facing wrapper: formats live system stats as text for JARVIS
+    """Tool-facing wrapper: formats live system stats as text for ORACLE
     to read out or discuss in conversation."""
     s = get_system_stats_dict()
     lines = [
@@ -475,6 +486,438 @@ def web_search(query: str) -> str:
     return "\n\n".join(formatted)
 
 
+def open_web_search(query: str) -> str:
+    """
+    Opens the user's default web browser to a real, visible search results
+    page - unlike web_search above, which fetches results as text for
+    ORACLE to read and summarize, this actually launches a browser tab so
+    the user can look at and interact with the results themselves.
+    """
+    url = f"https://www.google.com/search?q={quote_plus(query)}"
+    try:
+        webbrowser.open(url, new=2)  # new=2: open in a new tab, not the same window
+        return f"Opened a web search for '{query}' in your browser."
+    except Exception as e:
+        return f"Error opening web search: {e}"
+
+
+def open_url(url: str) -> str:
+    """
+    Opens a specific web address in the user's default browser - for when
+    the user names an actual site to go to (e.g. "open youtube.com"),
+    as opposed to searching for something (see open_web_search/web_search).
+    """
+    url = url.strip()
+
+    # Add a scheme if the user just said "youtube.com" without one.
+    if not re.match(r"^https?://", url, re.IGNORECASE):
+        url = f"https://{url}"
+
+    # Basic sanity check - must look like an actual domain, and only
+    # http(s) is allowed (guards against something like a javascript: or
+    # file: URI slipping through, which "open this website" should never
+    # trigger).
+    if not re.match(r"^https?://[^\s]+\.[^\s]+", url, re.IGNORECASE):
+        return f"Error: '{url}' doesn't look like a valid web address."
+
+    try:
+        webbrowser.open(url, new=2)
+        return f"Opened {url}"
+    except Exception as e:
+        return f"Error opening '{url}': {e}"
+
+
+# ---------------------------------------------------------------------------
+# VOICE INPUT: local, free speech-to-text via faster-whisper. Recording
+# happens entirely in Python (via sounddevice) rather than in the browser -
+# this keeps audio capture and transcription in one place instead of
+# encoding audio in JS and shipping it across the pywebview bridge.
+# ---------------------------------------------------------------------------
+
+# "base" balances speed and accuracy reasonably well on CPU-only hardware
+# (no dedicated GPU here). "tiny" is faster but noticeably less accurate;
+# "small"/"medium" are more accurate but slower per transcription.
+WHISPER_MODEL_SIZE = "base"
+SAMPLE_RATE = 16000  # Whisper's native input rate - recording at this rate
+                      # directly avoids a separate resampling step.
+
+_whisper_model = None
+_recording_stream = None
+_recording_frames = []
+
+
+def _get_whisper_model():
+    """Lazily loads the Whisper model on first use (this can take a few
+    seconds and downloads model weights on first run ever) rather than
+    slowing down every ORACLE startup, most of which won't use voice."""
+    global _whisper_model
+    if _whisper_model is None:
+        from faster_whisper import WhisperModel
+        _whisper_model = WhisperModel(WHISPER_MODEL_SIZE, device="cpu", compute_type="int8")
+    return _whisper_model
+
+
+def start_recording() -> str:
+    """Begins capturing microphone audio into memory. Call
+    stop_recording_and_transcribe() to end it and get the transcribed text."""
+    global _recording_stream, _recording_frames
+
+    if _recording_stream is not None:
+        return "Already recording."
+
+    _recording_frames = []
+
+    def _callback(indata, frames, time_info, status):
+        _recording_frames.append(indata.copy())
+
+    try:
+        _recording_stream = sd.InputStream(
+            samplerate=SAMPLE_RATE, channels=1, dtype="float32", callback=_callback
+        )
+        _recording_stream.start()
+        return "Recording started."
+    except Exception as e:
+        _recording_stream = None
+        return f"Error starting recording: {e}"
+
+
+def stop_recording_and_transcribe() -> str:
+    """Stops capturing audio and transcribes whatever was recorded."""
+    global _recording_stream, _recording_frames
+
+    if _recording_stream is None:
+        return "Error: not currently recording."
+
+    try:
+        _recording_stream.stop()
+        _recording_stream.close()
+    except Exception as e:
+        _recording_stream = None
+        return f"Error stopping recording: {e}"
+
+    _recording_stream = None
+
+    if not _recording_frames:
+        return "Error: no audio was captured."
+
+    audio = np.concatenate(_recording_frames, axis=0).flatten()
+    _recording_frames = []
+
+    # Rough silence check - a very quiet/empty recording (e.g. mic muted,
+    # or the stop button hit almost immediately) shouldn't be sent to
+    # Whisper at all, since it tends to hallucinate text from near-silence.
+    if np.abs(audio).mean() < 0.001:
+        return "Error: no speech detected (audio was silent)."
+
+    try:
+        model = _get_whisper_model()
+        segments, _ = model.transcribe(audio, language=None)
+        text = " ".join(segment.text.strip() for segment in segments).strip()
+    except Exception as e:
+        return f"Error transcribing audio: {e}"
+
+    return text if text else "Error: could not understand the audio."
+
+
+# Tunable VAD (voice activity detection) parameters for listen_and_transcribe.
+CALIBRATION_DURATION_SEC = 0.5   # brief ambient-noise measurement before listening starts
+SPEECH_THRESHOLD_MULTIPLIER = 3.5  # how far above the measured noise floor counts as speech
+MIN_SPEECH_THRESHOLD = 0.01      # floor, so a near-silent room doesn't make the mic's own
+                                  # self-noise register as "speech"
+SILENCE_DURATION_SEC = 1.2       # pause length (after speech) that ends listening
+NO_SPEECH_TIMEOUT_SEC = 8.0      # give up if nothing is said within this long (calibration
+                                  # eats into this window, so it's a bit longer than before)
+MAX_RECORDING_SEC = 20.0         # hard safety cap regardless of VAD state
+
+
+def listen_and_transcribe() -> str:
+    """
+    Listens via the microphone until you pause after speaking (or a safety
+    timeout elapses), then transcribes what was captured - a single
+    blocking call, unlike start_recording/stop_recording_and_transcribe's
+    manual two-step. This is what the global hotkey uses: press it, talk,
+    stop talking, and this returns once it detects you're done - the same
+    turn-taking style used by voice mode in other AI chat apps.
+
+    The first CALIBRATION_DURATION_SEC of audio is used to measure YOUR
+    mic's actual ambient noise floor rather than assuming a fixed volume
+    level - different microphones and rooms have very different baseline
+    noise, so a single hardcoded threshold either misses quiet speech or
+    (more often) never sees true silence at all if the room's baseline is
+    louder than the hardcoded guess.
+    """
+    frames = []
+    done = threading.Event()
+    state = {
+        "speech_detected": False,
+        "silence_frames": 0,
+        "total_frames": 0,
+        "calibration_rms": [],
+        "threshold": None,  # set once calibration finishes
+    }
+
+    def callback(indata, frame_count, time_info, status):
+        frames.append(indata.copy())
+        state["total_frames"] += frame_count
+        rms = float(np.sqrt(np.mean(indata.astype(np.float64) ** 2)))
+        elapsed = state["total_frames"] / SAMPLE_RATE
+
+        # Phase 1: calibration - just measure, don't judge speech/silence yet.
+        if state["threshold"] is None:
+            state["calibration_rms"].append(rms)
+            if elapsed >= CALIBRATION_DURATION_SEC:
+                noise_floor = float(np.mean(state["calibration_rms"]))
+                state["threshold"] = max(
+                    noise_floor * SPEECH_THRESHOLD_MULTIPLIER, MIN_SPEECH_THRESHOLD
+                )
+            return
+
+        # Phase 2: normal VAD logic, using the calibrated threshold.
+        if rms > state["threshold"]:
+            state["speech_detected"] = True
+            state["silence_frames"] = 0
+        elif state["speech_detected"]:
+            state["silence_frames"] += frame_count
+
+        silence_elapsed = state["silence_frames"] / SAMPLE_RATE
+
+        if state["speech_detected"] and silence_elapsed >= SILENCE_DURATION_SEC:
+            raise sd.CallbackStop()
+        if not state["speech_detected"] and elapsed >= NO_SPEECH_TIMEOUT_SEC:
+            raise sd.CallbackStop()
+        if elapsed >= MAX_RECORDING_SEC:
+            raise sd.CallbackStop()
+
+    def _finished():
+        done.set()
+
+    try:
+        stream = sd.InputStream(
+            samplerate=SAMPLE_RATE,
+            channels=1,
+            dtype="float32",
+            blocksize=int(SAMPLE_RATE * 0.1),  # ~100ms chunks for responsive VAD
+            callback=callback,
+            finished_callback=_finished,
+        )
+    except Exception as e:
+        return f"Error starting microphone: {e}"
+
+    with stream:
+        # Extra couple seconds of margin beyond MAX_RECORDING_SEC, purely
+        # so this wait() can't itself hang forever in some edge case.
+        done.wait(timeout=MAX_RECORDING_SEC + 2)
+
+    if not frames:
+        return "Error: no audio was captured."
+
+    audio = np.concatenate(frames, axis=0).flatten()
+
+    if not state["speech_detected"]:
+        return "Error: no speech detected."
+
+    try:
+        model = _get_whisper_model()
+        segments, _ = model.transcribe(audio, language=None)
+        text = " ".join(segment.text.strip() for segment in segments).strip()
+    except Exception as e:
+        return f"Error transcribing audio: {e}"
+
+    return text if text else "Error: could not understand the audio."
+
+
+# ---------------------------------------------------------------------------
+# WAKE WORD: no free pretrained wake-word engine (openWakeWord, Porcupine,
+# etc.) ships with an arbitrary custom word like "oracle" - those need a
+# real training pipeline with audio data, which isn't practical to set up
+# here. Instead, this continuously transcribes short rolling windows of
+# audio with our existing Whisper model and checks the text for the word.
+#
+# Honest trade-off: this is meaningfully more CPU-hungry running
+# continuously than a dedicated lightweight wake-word model would be
+# (those typically use <1% CPU; ours periodically runs real speech
+# recognition). Using the smallest "tiny" Whisper model specifically for
+# this constant background check - separate from the more accurate "base"
+# model used for actual commands - keeps that cost as low as reasonably
+# possible while still working for a custom word with zero training.
+# ---------------------------------------------------------------------------
+
+WAKE_WORD = "oracle"
+WAKE_WHISPER_MODEL_SIZE = "tiny"
+WAKE_WINDOW_SEC = 3.0          # how much recent audio is checked each time
+WAKE_CHECK_INTERVAL_SEC = 1.5  # how often to check (creates overlap with the
+                                # window above, so the word isn't missed if
+                                # it lands right on a boundary)
+WAKE_CHUNK_SEC = 0.5           # size of each buffered audio chunk
+
+_wake_whisper_model = None
+_wake_buffer = collections.deque(maxlen=int(WAKE_WINDOW_SEC / WAKE_CHUNK_SEC))
+_wake_buffer_lock = threading.Lock()
+_wake_stream = None
+
+
+def _get_wake_whisper_model():
+    """Separate, smaller model instance from the one used for actual
+    command transcription - see the module-level comment above for why."""
+    global _wake_whisper_model
+    if _wake_whisper_model is None:
+        from faster_whisper import WhisperModel
+        _wake_whisper_model = WhisperModel(WAKE_WHISPER_MODEL_SIZE, device="cpu", compute_type="int8")
+    return _wake_whisper_model
+
+
+def _wake_callback(indata, frame_count, time_info, status):
+    with _wake_buffer_lock:
+        _wake_buffer.append(indata.copy())
+
+
+def start_wake_word_stream() -> str:
+    """Starts the continuous background microphone stream that feeds the
+    rolling buffer check_for_wake_word() reads from."""
+    global _wake_stream
+    if _wake_stream is not None:
+        return "Already listening for wake word."
+    try:
+        _wake_stream = sd.InputStream(
+            samplerate=SAMPLE_RATE,
+            channels=1,
+            dtype="float32",
+            blocksize=int(SAMPLE_RATE * WAKE_CHUNK_SEC),
+            callback=_wake_callback,
+        )
+        _wake_stream.start()
+        return "Wake word listening started."
+    except Exception as e:
+        _wake_stream = None
+        return f"Error starting wake word stream: {e}"
+
+
+def stop_wake_word_stream():
+    """Stops the wake-word background stream - used while a voice turn is
+    actively being handled, so the mic isn't fought over by two streams
+    at once and so the buffer doesn't re-trigger on residual audio."""
+    global _wake_stream
+    if _wake_stream is not None:
+        try:
+            _wake_stream.stop()
+            _wake_stream.close()
+        except Exception:
+            pass
+        _wake_stream = None
+    with _wake_buffer_lock:
+        _wake_buffer.clear()
+
+
+def check_for_wake_word() -> bool:
+    """
+    Transcribes whatever's currently in the rolling buffer and checks for
+    the wake word. Called periodically (see run_wake_word_listener in
+    ui.py) rather than continuously, since running Whisper truly
+    non-stop would be excessive - the WAKE_CHECK_INTERVAL_SEC gap plus
+    the buffer's overlap is the balance between catching the word
+    promptly and not pegging the CPU constantly.
+    """
+    with _wake_buffer_lock:
+        if not _wake_buffer:
+            return False
+        audio = np.concatenate(list(_wake_buffer), axis=0).flatten()
+
+    # Cheap check before bothering Whisper at all - skip near-silent windows.
+    if np.abs(audio).mean() < 0.001:
+        return False
+
+    try:
+        model = _get_wake_whisper_model()
+        segments, _ = model.transcribe(audio, language=None)
+        text = " ".join(segment.text for segment in segments).lower()
+    except Exception:
+        return False
+
+    cleaned = re.sub(r"[^a-z\s]", "", text)
+    return WAKE_WORD in cleaned
+
+
+# ---------------------------------------------------------------------------
+# TEXT-TO-SPEECH: local, free voice output via Piper. Every ORACLE reply
+# gets spoken, whether it came from typing or voice - see ui.py for where
+# this actually gets called (kept out of the conversational logic here so
+# core.py doesn't need to know whether a reply is about to hit a chat
+# window, a voice turn, or both).
+# ---------------------------------------------------------------------------
+
+PIPER_VOICE_NAME = "en_US-lessac-medium"  # solid general-purpose default voice
+_piper_voice = None
+
+
+def _strip_markdown_for_speech(text: str) -> str:
+    """
+    Removes markdown formatting before handing text to Piper - without
+    this, a reply like "**Note:** run `python ui.py`" would be read aloud
+    literally as "asterisk asterisk Note asterisk asterisk colon run
+    backtick python ui dot py backtick", which is unusable. Code blocks
+    are dropped entirely rather than read aloud, since spoken code is
+    rarely useful and often very long.
+    """
+    text = re.sub(r"```.*?```", "", text, flags=re.DOTALL)
+    text = re.sub(r"`([^`]+)`", r"\1", text)
+    text = re.sub(r"\*\*([^*]+)\*\*", r"\1", text)
+    text = re.sub(r"(?<!\*)\*([^*\n]+)\*(?!\*)", r"\1", text)
+    text = re.sub(r"^#{1,6}\s+", "", text, flags=re.MULTILINE)
+    text = re.sub(r"^[-*•]\s+", "", text, flags=re.MULTILINE)
+    text = re.sub(r"^\d+\.\s+", "", text, flags=re.MULTILINE)
+    return text.strip()
+
+
+def _get_piper_voice():
+    """
+    Lazily loads (and downloads, on first-ever use) the Piper voice model.
+    Downloaded once into ORACLE's own data directory - after that first
+    run, this is instant and fully offline.
+    """
+    global _piper_voice
+    if _piper_voice is None:
+        from piper import PiperVoice
+        from piper.download_voices import download_voice
+
+        voice_dir = Path(_get_data_dir()) / "voices"
+        voice_dir.mkdir(parents=True, exist_ok=True)
+
+        download_voice(PIPER_VOICE_NAME, voice_dir)  # no-ops if already downloaded
+
+        model_path = voice_dir / f"{PIPER_VOICE_NAME}.onnx"
+        config_path = voice_dir / f"{PIPER_VOICE_NAME}.onnx.json"
+        _piper_voice = PiperVoice.load(str(model_path), str(config_path))
+    return _piper_voice
+
+
+def speak(text: str) -> str:
+    """
+    Synthesizes text to speech locally via Piper and plays it through the
+    default audio output. Blocks until playback finishes - callers that
+    don't want to wait (e.g. so a chat message can appear immediately
+    instead of only after the audio finishes) should run this in a
+    background thread instead of calling it directly.
+    """
+    cleaned = _strip_markdown_for_speech(text)
+    if not cleaned:
+        return "Error: no speakable text after removing formatting."
+
+    try:
+        voice = _get_piper_voice()
+        chunks = list(voice.synthesize(cleaned))
+        if not chunks:
+            return "Error: no audio was generated."
+
+        audio = np.concatenate([c.audio_float_array for c in chunks])
+        sample_rate = chunks[0].sample_rate
+
+        sd.play(audio, samplerate=sample_rate)
+        sd.wait()
+        return "Spoken."
+    except Exception as e:
+        return f"Error speaking: {e}"
+
+
 # Lazily created for the same reason as the Tavily client - a missing or
 # broken toast library shouldn't crash the whole app at startup, only the
 # one tool that actually needs it.
@@ -484,8 +927,8 @@ _toaster = None
 def send_notification(title: str, message: str = "") -> str:
     """
     Shows a real Windows toast notification (the kind that pops up from
-    the notification area), separate from anything shown in the JARVIS
-    chat window itself - useful for things JARVIS wants to flag even if
+    the notification area), separate from anything shown in the ORACLE
+    chat window itself - useful for things ORACLE wants to flag even if
     you're not actively looking at the app.
     """
     if sys.platform != "win32":
@@ -496,7 +939,7 @@ def send_notification(title: str, message: str = "") -> str:
         from windows_toasts import Toast, WindowsToaster
 
         if _toaster is None:
-            _toaster = WindowsToaster("JARVIS")
+            _toaster = WindowsToaster("ORACLE")
 
         toast = Toast()
         toast.text_fields = [title, message] if message else [title]
@@ -657,9 +1100,11 @@ TOOLS = [
         "function": {
             "name": "web_search",
             "description": (
-                "Search the web for current information - news, facts, prices, "
-                "anything that requires up-to-date or external knowledge you "
-                "wouldn't already know."
+                "Search the web for current information and get results back as text "
+                "for you to read and summarize in the conversation - the user does NOT "
+                "see a browser. Use this when the user is asking a question you need "
+                "an answer to. For when the user wants to actually SEE search results "
+                "themselves in their browser, use open_web_search instead."
             ),
             "parameters": {
                 "type": "object",
@@ -673,11 +1118,55 @@ TOOLS = [
     {
         "type": "function",
         "function": {
+            "name": "open_web_search",
+            "description": (
+                "Opens the user's default web browser to a real search results page "
+                "they can see and interact with - use this when the user asks you to "
+                "search for something and clearly wants to look at the results "
+                "themselves (e.g. 'search for X', 'look up Y for me'), as opposed to "
+                "asking you a question you should just answer directly (use web_search "
+                "for that instead). If the user instead names a specific website to "
+                "visit (e.g. 'open youtube.com', 'go to github'), use open_url instead."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "The search query."}
+                },
+                "required": ["query"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "open_url",
+            "description": (
+                "Opens a specific website in the user's default browser - use this "
+                "when the user names an actual site or address to go to (e.g. 'open "
+                "youtube.com', 'go to github.com/anthropics'), as opposed to searching "
+                "for something (use web_search or open_web_search for that instead)."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "url": {
+                        "type": "string",
+                        "description": "The web address to open, e.g. 'youtube.com' or 'https://github.com'.",
+                    }
+                },
+                "required": ["url"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "send_notification",
             "description": (
                 "Show a real Windows toast/system notification - separate from "
                 "the chat window, visible even if the user isn't looking at "
-                "JARVIS right now. Use this for alerts the user should notice "
+                "ORACLE right now. Use this for alerts the user should notice "
                 "even if they're not in the app."
             ),
             "parameters": {
@@ -704,6 +1193,8 @@ AVAILABLE_FUNCTIONS = {
     "create_file": create_file,
     "get_system_info": get_system_info,
     "web_search": web_search,
+    "open_web_search": open_web_search,
+    "open_url": open_url,
     "send_notification": send_notification,
 }
 
@@ -805,22 +1296,21 @@ def run_conversation(user_input: str, history: list) -> str:
     return give_up
 
 
-def generate_greeting(resuming: bool) -> str:
+def generate_wake_greeting() -> str:
     """
-    One-off, lightweight LLM call for a short greeting - deliberately NOT
-    run through run_conversation/tools, since a greeting never needs a tool
-    and this keeps startup to a single fast API call instead of a full
-    tool-calling round trip.
+    One-off, lightweight LLM call for a short greeting spoken when the
+    wake word activates ORACLE - deliberately NOT run through
+    run_conversation/tools, since a greeting never needs a tool and this
+    keeps activation to a single fast API call instead of a full
+    tool-calling round trip. Explicitly asked to vary its phrasing each
+    time rather than reusing the same line on every activation.
     """
-    context = (
-        "This is a fresh start with no prior conversation."
-        if not resuming else
-        "You are resuming a conversation with the user from a previous session."
-    )
     prompt = (
-        f"The current time is {get_current_time()}. {context} "
-        "Greet the user in one short, natural sentence, in character as established "
-        "in your system prompt - calm, dry-witted, quietly loyal. Not a generic "
+        f"The current time is {get_current_time()}. The user (whom you address as "
+        f"'{USER_NAME}') just activated you with your wake word. Greet them by name "
+        "in one short, natural sentence, in character as established in your system "
+        "prompt - calm, dry-witted, quietly loyal. Vary your phrasing meaningfully "
+        "each time rather than repeating a fixed template - not a generic "
         "'How can I help you today?'"
     )
     response = client.chat.completions.create(
@@ -840,21 +1330,17 @@ if __name__ == "__main__":
 
     init_db()
 
-    print("JARVIS core - terminal test mode. Type 'quit' to exit.\n")
-    print("(For the full JARVIS experience, run ui.py instead.)\n")
+    print("ORACLE core - terminal test mode. Type 'quit' to exit.\n")
+    print("(For the full ORACLE experience, run ui.py instead.)\n")
 
     conversation_history = [{"role": "system", "content": SYSTEM_PROMPT}]
     prior_messages = load_recent_history()
     if prior_messages:
         conversation_history.extend(prior_messages)
 
-    greeting = generate_greeting(resuming=bool(prior_messages))
-    print(f"JARVIS: {greeting}\n")
-    conversation_history.append({"role": "assistant", "content": greeting})
-
     while True:
         user_text = input("You: ")
         if user_text.lower() in ("quit", "exit"):
             break
         reply = run_conversation(user_text, conversation_history)
-        print(f"JARVIS: {reply}\n")
+        print(f"ORACLE: {reply}\n")
