@@ -1,46 +1,44 @@
 """
 ORACLE - Background Desktop App
 
-Two separate windows now:
-  - The HUD (index.html): fullscreen, borderless, shows the status ring.
-    Activated by the wake word ("Oracle") - listens, replies, and SPEAKS
-    the reply out loud.
-  - The Chat window (chat.html): a normal-sized window you open via the
-    chat icon in the HUD's top bar. Typed (or mic-dictated-then-edited)
-    conversations here stay TEXT-ONLY - ORACLE never speaks a reply to
-    something you typed, since you're already looking at the screen.
+Single window now (merged from the earlier HUD + separate chat window
+split): a sidebar on the left, and a main area that shows a hero greeting
+with the status ring and a big input box when there's no conversation
+yet, collapsing into a normal scrolling chat view once you send a
+message - similar in spirit to Claude's own desktop app. The ring stays
+click-to-talk throughout, whether in the hero or the compact top-bar
+version once a conversation is active.
 
-Both windows hide to the tray rather than closing outright; ORACLE keeps
+The window hides to the tray rather than closing outright; ORACLE keeps
 running in the background until you explicitly Quit from the tray menu.
 
 Note: true window transparency was attempted but dropped - Windows'
 WebView2 engine has ongoing, unresolved bugs rendering transparent
 windows correctly (confirmed via multiple open upstream issues as of
-2026), so both windows use a solid opaque background instead.
+2026), so this uses a solid opaque background instead.
 
 SETUP:
     pip install -r requirements.txt
     python ui.py
 
 Look for the ORACLE icon in your system tray (may be under the "^" hidden
-icons arrow) to show/hide the HUD or quit for real.
+icons arrow) to show/hide the window or quit for real.
 """
 
 import threading
 import os
 import sys
 import json
-import time
 import webview
 import pystray
 from PIL import Image, ImageDraw
 import core
 
-# Module-level references so the wake-word thread, tray thread, and Api
-# bridge can all reach the same window/api objects.
-_hud_window = None
-_chat_window = None
+# Module-level references so the tray thread and Api bridge can both
+# reach the same window/api objects.
+_window = None
 _api = None
+_is_maximized = False
 
 
 def resource_path(relative_path: str) -> str:
@@ -96,23 +94,140 @@ def _ensure_autostart():
 
 
 class Api:
-    """
-    Bridge between both windows' JS and core.py's conversation logic.
-    send_message is called only from the chat window and deliberately
-    does NOT speak the reply - voice output is reserved for the wake-word
-    flow (_wake_turn below), which runs entirely in Python and speaks
-    directly, bypassing this bridge.
+    """Bridge between the window's JS and core.py's conversation logic.
+    send_message is called from typed/mic-dictated-then-edited input and
+    deliberately does NOT speak the reply - voice output is reserved for
+    the ring-click flow (_voice_turn below), which runs entirely in
+    Python and speaks directly, bypassing this bridge.
+
+    Starts fresh each launch (empty hero state, like Claude's own desktop
+    app) rather than silently continuing the last conversation - past
+    conversations are reopened explicitly via the sidebar instead.
     """
 
     def __init__(self):
         core.init_db()
         self.history = [{"role": "system", "content": core.SYSTEM_PROMPT}]
-        prior = core.load_recent_history()
-        if prior:
-            self.history.extend(prior)
+        self.current_conversation_id = None
+        self.current_project_id = None
+        self.current_project_path = None
 
-    def send_message(self, text: str) -> str:
-        return core.run_conversation(text, self.history)
+    def _ensure_conversation(self, first_message: str) -> int:
+        """Creates a new conversation thread on the first message of a
+        fresh chat, or returns the already-active one - shared by both
+        the typed-message path and the ring-click voice path so a
+        conversation is only ever created once, however it started.
+        Tags the new conversation to the active project, if any."""
+        if self.current_conversation_id is None:
+            self.current_conversation_id = core.create_conversation(
+                first_message, project_id=self.current_project_id
+            )
+        return self.current_conversation_id
+
+    def send_message(self, text: str, agent: str = "main") -> str:
+        """
+        Routing priority: an active project always wins (it implies
+        coding-with-file-access, regardless of the agent dropdown) -
+        otherwise agent selects "main" (full tool access) or "coding"
+        (stateless delegate to the coding specialist, no file access).
+        """
+        conversation_id = self._ensure_conversation(text)
+
+        if self.current_project_path:
+            return core.run_project_conversation(
+                text, self.history, conversation_id, self.current_project_path
+            )
+
+        if agent == "coding":
+            reply = core.ask_coding_agent(text)
+            user_msg = {"role": "user", "content": text}
+            self.history.append(user_msg)
+            core.save_message(user_msg, conversation_id)
+            assistant_msg = {"role": "assistant", "content": reply}
+            self.history.append(assistant_msg)
+            core.save_message(assistant_msg, conversation_id)
+            return reply
+
+        return core.run_conversation(text, self.history, conversation_id)
+
+    def list_conversations(self) -> list:
+        return core.list_conversations()
+
+    def load_chat(self, conversation_id: int) -> list:
+        """
+        Reopens a past conversation from the sidebar: switches the active
+        thread, reloads full context for the model, and returns just the
+        user/assistant turns (skipping tool-call plumbing messages, which
+        were never shown in the log to begin with) for the UI to redraw.
+        Exits project mode - this is for regular standalone chats.
+        """
+        self.current_project_id = None
+        self.current_project_path = None
+        self.current_conversation_id = conversation_id
+        messages = core.load_conversation_messages(conversation_id)
+        self.history = [{"role": "system", "content": core.SYSTEM_PROMPT}] + messages
+
+        display = []
+        for m in messages:
+            if m["role"] == "user" and m.get("content"):
+                display.append({"role": "user", "content": m["content"]})
+            elif m["role"] == "assistant" and m.get("content"):
+                display.append({"role": "jarvis", "content": m["content"]})
+        return display
+
+    def choose_projects_root(self):
+        """
+        Opens the native OS folder picker so the user can point ORACLE at
+        their projects folder (e.g. D:\\Projects). Persists the choice so
+        it's remembered across restarts. Returns the chosen path, or None
+        if the user cancelled.
+        """
+        if not _window:
+            return None
+        result = _window.create_file_dialog(webview.FileDialog.FOLDER)
+        if not result:
+            return None
+        path = result[0]
+        core.set_setting("projects_root", path)
+        return path
+
+    def get_projects_root(self):
+        return core.get_setting("projects_root")
+
+    def list_projects(self) -> list:
+        root = core.get_setting("projects_root")
+        return core.list_projects_in_root(root)
+
+    def open_project(self, path: str) -> list:
+        """
+        Switches into project mode: looks up (or creates) the project
+        record, reopens its existing conversation thread if one exists
+        (each project has exactly one ongoing thread, not multiple named
+        chats), and returns display-safe messages for the UI to redraw -
+        same shape as load_chat.
+        """
+        project_id = core.get_or_create_project(path)
+        self.current_project_id = project_id
+        self.current_project_path = path
+        project_name = os.path.basename(os.path.normpath(path)) or path
+
+        existing_conv_id = core.get_project_conversation_id(project_id)
+        if existing_conv_id is None:
+            self.current_conversation_id = None
+            self.history = [{"role": "system", "content": core.project_system_prompt(project_name)}]
+            return []
+
+        self.current_conversation_id = existing_conv_id
+        messages = core.load_conversation_messages(existing_conv_id)
+        self.history = [{"role": "system", "content": core.project_system_prompt(project_name)}] + messages
+
+        display = []
+        for m in messages:
+            if m["role"] == "user" and m.get("content"):
+                display.append({"role": "user", "content": m["content"]})
+            elif m["role"] == "assistant" and m.get("content"):
+                display.append({"role": "jarvis", "content": m["content"]})
+        return display
 
     def get_system_stats(self) -> dict:
         return core.get_system_stats_dict()
@@ -123,122 +238,128 @@ class Api:
     def stop_recording(self) -> str:
         return core.stop_recording_and_transcribe()
 
+    def new_chat(self):
+        """Resets to a fresh, not-yet-created conversation - the next
+        message sent will start a genuinely new thread. Also exits
+        project mode, back to the regular main assistant."""
+        self.history = [{"role": "system", "content": core.SYSTEM_PROMPT}]
+        self.current_conversation_id = None
+        self.current_project_id = None
+        self.current_project_path = None
+
+    def rename_conversation(self, conversation_id: int, new_title: str):
+        core.rename_conversation(conversation_id, new_title)
+
+    def delete_conversation(self, conversation_id: int):
+        """If this happens to be the currently active chat, reset to a
+        fresh state first so nothing is left pointing at a deleted
+        thread."""
+        core.delete_conversation(conversation_id)
+        if self.current_conversation_id == conversation_id:
+            self.new_chat()
+
+    def toggle_pin_conversation(self, conversation_id: int) -> bool:
+        return core.toggle_pin_conversation(conversation_id)
+
+    def rename_project(self, project_id: int, new_name: str):
+        core.rename_project(project_id, new_name)
+
+    def delete_project(self, project_id: int):
+        """Removes the project from ORACLE's tracking only - never
+        touches the actual folder or files (see core.delete_project)."""
+        core.delete_project(project_id)
+        if self.current_project_id == project_id:
+            self.new_chat()
+
+    def toggle_pin_project(self, project_id: int) -> bool:
+        return core.toggle_pin_project(project_id)
+
+    def start_voice_turn(self):
+        """
+        Called when the ring is clicked. Fires _voice_turn on a
+        background thread and returns immediately - the click shouldn't
+        block waiting for the whole listen-respond-speak cycle to finish,
+        since that can take several seconds.
+        """
+        threading.Thread(target=_voice_turn, daemon=True).start()
+
     def hide_window(self):
-        """Hides the HUD window - called by the HUD's own "-" button."""
-        if _hud_window:
-            _hud_window.hide()
+        """Hides the window to the tray - the "x" (close) button."""
+        if _window:
+            _window.hide()
 
-    def show_chat_window(self):
-        """Shows the chat window - called by the HUD's chat-icon button."""
-        if _chat_window:
-            _chat_window.show()
+    def minimize_window(self):
+        if _window:
+            _window.minimize()
 
-    def hide_chat_window(self):
-        """Hides the chat window - called by the chat window's own "-" button."""
-        if _chat_window:
-            _chat_window.hide()
+    def toggle_maximize_window(self):
+        """
+        pywebview doesn't expose a reliable "is this window currently
+        maximized" query, so we track it ourselves to know whether the
+        next click should maximize or restore.
+        """
+        global _is_maximized
+        if _window:
+            if _is_maximized:
+                _window.restore()
+            else:
+                _window.maximize()
+            _is_maximized = not _is_maximized
 
 
-def _run_js_hud(script: str):
-    """Pushes JS into the HUD window from Python's own initiative - used
-    during wake-word activation, which happens on a background thread
-    with no click involved."""
-    if _hud_window:
+def _run_js(script: str):
+    """Pushes JS into the window from Python's own initiative - used
+    during the ring-click voice flow, which happens on a background
+    thread with no further click involved once started."""
+    if _window:
         try:
-            _hud_window.evaluate_js(script)
+            _window.evaluate_js(script)
         except Exception as e:
-            print(f"evaluate_js (HUD) failed: {e}")
+            print(f"evaluate_js failed: {e}")
 
 
-def _run_js_chat(script: str):
-    """Same as _run_js_hud, but for the chat window - used to log the
-    wake-word conversation into the chat transcript even when that window
-    isn't currently visible, so the history is there if you open it later."""
-    if _chat_window:
-        try:
-            _chat_window.evaluate_js(script)
-        except Exception as e:
-            print(f"evaluate_js (chat) failed: {e}")
-
-
-def _wake_turn():
+def _voice_turn():
     """
-    The full wake-word-triggered interaction: show the HUD if it was
-    hidden, greet the user (varied each time), listen for their command,
-    transcribe it, get ORACLE's reply - speaking both the greeting and
-    the reply out loud - while also logging the exchange into the chat
-    window's transcript (without forcing that window to open).
+    The full ring-click interaction: show the window if it was hidden,
+    listen for a command right away (no greeting - a click is already an
+    explicit "listen now" signal), transcribe it, get ORACLE's reply -
+    speaking it out loud - while pushing both sides of the exchange into
+    the visible chat log.
     """
-    if _hud_window:
-        _hud_window.show()
+    if _window:
+        _window.show()
 
-    _run_js_hud("document.getElementById('ringStatus').textContent = 'ACTIVATED';")
-
-    greeting = core.generate_wake_greeting()
-    _api.history.append({"role": "assistant", "content": greeting})
-    _run_js_chat(f"addMessage('jarvis', {json.dumps(greeting)});")
-    core.speak(greeting)
-
-    _run_js_hud("document.getElementById('ringStatus').textContent = 'LISTENING...';")
-    _run_js_hud("document.getElementById('ring').classList.add('thinking');")
+    _run_js("setRingStatus('LISTENING...'); setRingThinking(true);")
 
     text = core.listen_and_transcribe()
 
     if not text or text.startswith("Error"):
-        print(f"Wake turn ended without a usable command: {text}")
-        _run_js_hud("document.getElementById('ring').classList.remove('thinking');")
-        _run_js_hud("document.getElementById('ringStatus').textContent = 'READY / AWAITING INPUT';")
+        print(f"Voice turn ended without a usable command: {text}")
+        _run_js("setRingThinking(false); setRingStatus('');")
         return
 
-    _run_js_chat(f"addMessage('user', {json.dumps(text)});")
-    _run_js_hud("document.getElementById('ringStatus').textContent = 'THINKING...';")
+    _run_js(f"addMessage('user', {json.dumps(text)});")
+    _run_js("setRingStatus('THINKING...');")
 
-    reply = core.run_conversation(text, _api.history)
+    conversation_id = _api._ensure_conversation(text)
+    reply = core.run_conversation(text, _api.history, conversation_id)
+    _run_js("if (typeof refreshChatList === 'function') refreshChatList();")
 
-    _run_js_chat(f"addMessage('jarvis', {json.dumps(reply)});")
-    _run_js_hud("document.getElementById('ringStatus').textContent = 'SPEAKING...';")
+    _run_js(f"addMessage('jarvis', {json.dumps(reply)});")
+    _run_js("setRingStatus('SPEAKING...');")
     core.speak(reply)
 
-    _run_js_hud("document.getElementById('ring').classList.remove('thinking');")
-    _run_js_hud("document.getElementById('ringStatus').textContent = 'READY / AWAITING INPUT';")
+    _run_js("setRingThinking(false); setRingStatus('');")
 
 
-def run_wake_word_listener():
+def on_closing():
     """
-    Runs on its own daemon thread. Starts the continuous background
-    microphone stream, then periodically checks it for the wake word.
-    While an actual voice turn is being handled, the wake-word stream is
-    stopped so the two don't fight over the microphone and so old
-    buffered audio can't immediately re-trigger.
-    """
-    core.start_wake_word_stream()
-    try:
-        while True:
-            time.sleep(core.WAKE_CHECK_INTERVAL_SEC)
-            if core.check_for_wake_word():
-                core.stop_wake_word_stream()
-                try:
-                    _wake_turn()
-                finally:
-                    core.start_wake_word_stream()
-    except Exception as e:
-        print(f"Wake word listener crashed: {e}")
-
-
-def on_hud_closing():
-    """
-    Intercepts the HUD window's close event. Returning False cancels the
+    Intercepts the window's close event. Returning False cancels the
     actual close (confirmed via pywebview's own source: a closing-event
     handler that returns False sets should_cancel=True internally) - we
     hide instead, so ORACLE keeps running with just the tray icon left.
     """
-    _hud_window.hide()
-    return False
-
-
-def on_chat_closing():
-    """Same idea as on_hud_closing, for the chat window."""
-    _chat_window.hide()
+    _window.hide()
     return False
 
 
@@ -253,31 +374,25 @@ def _make_tray_image():
 
 
 def _tray_show(icon, item):
-    if _hud_window:
-        _hud_window.show()
+    if _window:
+        _window.show()
 
 
 def _tray_hide(icon, item):
-    if _hud_window:
-        _hud_window.hide()
+    if _window:
+        _window.hide()
 
 
 def _tray_quit(icon, item):
     icon.stop()
-    if _chat_window:
-        _chat_window.destroy()
-    if _hud_window:
-        _hud_window.destroy()
+    if _window:
+        _window.destroy()
 
 
 def run_tray():
-    """
-    Runs the system tray icon's event loop. This must run on its own
+    """Runs the system tray icon's event loop. This must run on its own
     thread since webview.start() below blocks the main thread for its
-    own event loop - two GUI loops can't share one thread. Tray Show/Hide
-    controls the HUD only; the chat window has its own open/hide controls
-    (the HUD's chat icon, and the chat window's own "-" button).
-    """
+    own event loop - two GUI loops can't share one thread."""
     icon = pystray.Icon(
         "oracle",
         _make_tray_image(),
@@ -297,35 +412,20 @@ if __name__ == "__main__":
     api = Api()
     _api = api
 
-    _hud_window = webview.create_window(
+    _window = webview.create_window(
         "ORACLE",
         resource_path("index.html"),
         js_api=api,
-        fullscreen=True,   # fills the entire screen
-        frameless=True,    # no OS title bar/borders
+        width=1200,
+        height=780,
+        min_size=(760, 520),
+        frameless=True,   # no OS title bar/borders - custom "-" button instead
+        easy_drag=True,   # not fullscreen anymore, so this is draggable
         resizable=True,
     )
-    _hud_window.events.closing += on_hud_closing
-
-    _chat_window = webview.create_window(
-        "ORACLE - Chat",
-        resource_path("chat.html"),
-        js_api=api,
-        width=420,
-        height=640,
-        min_size=(320, 400),
-        frameless=True,
-        easy_drag=True,   # not fullscreen, so unlike the HUD this one benefits
-                           # from being draggable to reposition it
-        resizable=True,
-        hidden=True,       # starts closed - opened via the HUD's chat icon
-    )
-    _chat_window.events.closing += on_chat_closing
+    _window.events.closing += on_closing
 
     tray_thread = threading.Thread(target=run_tray, daemon=True)
     tray_thread.start()
-
-    wake_thread = threading.Thread(target=run_wake_word_listener, daemon=True)
-    wake_thread.start()
 
     webview.start()

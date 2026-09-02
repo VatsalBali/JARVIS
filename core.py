@@ -37,7 +37,6 @@ import psutil
 import sounddevice as sd
 import numpy as np
 import threading
-import collections
 import re
 from pathlib import Path
 from datetime import datetime, timedelta
@@ -59,7 +58,7 @@ SYSTEM_PROMPT = (
     "specialist rather than answering directly yourself."
 )
 
-# Name ORACLE uses when greeting you on wake-word activation.
+# Name ORACLE uses when greeting you on the ring-click voice flow (or generate_wake_greeting, if reused later).
 USER_NAME = "Oracle"
 
 # A directory listing goes into the conversation and is re-sent on every later
@@ -104,11 +103,22 @@ MAX_HISTORY_MESSAGES = 20
 # ---------------------------------------------------------------------------
 
 def init_db():
-    """Creates the messages table if it doesn't already exist."""
+    """Creates all tables if they don't already exist, and migrates older
+    databases (from before conversation threading, or before projects)
+    by adding new columns if missing."""
     conn = sqlite3.connect(DB_PATH)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS conversations (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            title TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )
+    """)
     conn.execute("""
         CREATE TABLE IF NOT EXISTS messages (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
+            conversation_id INTEGER,
             role TEXT NOT NULL,
             content TEXT,
             tool_calls TEXT,
@@ -116,18 +126,268 @@ def init_db():
             timestamp TEXT NOT NULL
         )
     """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS projects (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            path TEXT NOT NULL UNIQUE,
+            name TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS settings (
+            key TEXT PRIMARY KEY,
+            value TEXT
+        )
+    """)
+    # Migration: a DB created before conversation threading existed won't
+    # have this column - old messages just end up with conversation_id
+    # NULL (not deleted, just invisible to the new per-thread sidebar).
+    cols = [row[1] for row in conn.execute("PRAGMA table_info(messages)").fetchall()]
+    if "conversation_id" not in cols:
+        conn.execute("ALTER TABLE messages ADD COLUMN conversation_id INTEGER")
+    # Migration: a DB created before projects existed won't have this
+    # column on conversations - old conversations just end up with
+    # project_id NULL (regular chats, not tied to any project).
+    conv_cols = [row[1] for row in conn.execute("PRAGMA table_info(conversations)").fetchall()]
+    if "project_id" not in conv_cols:
+        conn.execute("ALTER TABLE conversations ADD COLUMN project_id INTEGER")
+    if "pinned" not in conv_cols:
+        conn.execute("ALTER TABLE conversations ADD COLUMN pinned INTEGER DEFAULT 0")
+
+    proj_cols = [row[1] for row in conn.execute("PRAGMA table_info(projects)").fetchall()]
+    if "pinned" not in proj_cols:
+        conn.execute("ALTER TABLE projects ADD COLUMN pinned INTEGER DEFAULT 0")
+
     conn.commit()
     conn.close()
 
 
-def save_message(message: dict):
-    """Appends a single message to the database, exactly as it will be
-    replayed into `history` later."""
+def create_conversation(first_message: str, project_id: int = None) -> int:
+    """
+    Starts a new conversation thread, titled from a truncated version of
+    its first message (simple and free - no extra LLM call just to name
+    a chat). If project_id is given, this thread is tied to that project
+    rather than being a regular standalone chat. Returns the new
+    conversation's ID.
+    """
+    title = first_message.strip().replace("\n", " ")[:50]
+    if len(first_message.strip()) > 50:
+        title += "..."
+    now = datetime.now().isoformat()
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.execute(
+        "INSERT INTO conversations (title, created_at, updated_at, project_id) VALUES (?, ?, ?, ?)",
+        (title, now, now, project_id),
+    )
+    conn.commit()
+    conversation_id = cursor.lastrowid
+    conn.close()
+    return conversation_id
+
+
+def get_setting(key: str) -> str:
+    conn = sqlite3.connect(DB_PATH)
+    row = conn.execute("SELECT value FROM settings WHERE key = ?", (key,)).fetchone()
+    conn.close()
+    return row[0] if row else None
+
+
+def set_setting(key: str, value: str):
     conn = sqlite3.connect(DB_PATH)
     conn.execute(
-        "INSERT INTO messages (role, content, tool_calls, tool_call_id, timestamp) "
-        "VALUES (?, ?, ?, ?, ?)",
+        "INSERT INTO settings (key, value) VALUES (?, ?) "
+        "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        (key, value),
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_or_create_project(path: str) -> int:
+    """Looks up a project by its folder path, creating one if this is the
+    first time it's been opened. Returns the project's ID."""
+    name = os.path.basename(os.path.normpath(path)) or path
+    conn = sqlite3.connect(DB_PATH)
+    row = conn.execute("SELECT id FROM projects WHERE path = ?", (path,)).fetchone()
+    if row:
+        conn.close()
+        return row[0]
+    now = datetime.now().isoformat()
+    cursor = conn.execute(
+        "INSERT INTO projects (path, name, created_at) VALUES (?, ?, ?)",
+        (path, name, now),
+    )
+    conn.commit()
+    project_id = cursor.lastrowid
+    conn.close()
+    return project_id
+
+
+def get_project_conversation_id(project_id: int):
+    """Returns the existing conversation thread for a project, if one has
+    been started yet - each project has exactly one ongoing thread, not
+    multiple named chats like the regular sidebar."""
+    conn = sqlite3.connect(DB_PATH)
+    row = conn.execute(
+        "SELECT id FROM conversations WHERE project_id = ? ORDER BY updated_at DESC LIMIT 1",
+        (project_id,),
+    ).fetchone()
+    conn.close()
+    return row[0] if row else None
+
+
+def get_project(project_id: int) -> dict:
+    conn = sqlite3.connect(DB_PATH)
+    row = conn.execute(
+        "SELECT id, path, name, pinned FROM projects WHERE id = ?", (project_id,)
+    ).fetchone()
+    conn.close()
+    if not row:
+        return None
+    return {"id": row[0], "path": row[1], "name": row[2], "pinned": bool(row[3])}
+
+
+def list_projects_in_root(root_path: str) -> list:
+    """
+    Lists immediate subfolders of the configured projects root - always a
+    live filesystem scan (not cached, so it stays accurate if folders are
+    added/removed outside ORACLE), merged with each folder's tracked
+    record (a possibly-renamed display name, pinned state) so the sidebar
+    reflects both reality on disk and any customization done in ORACLE.
+    Pinned projects sort first, then alphabetically by display name.
+    """
+    if not root_path or not os.path.isdir(root_path):
+        return []
+    entries = []
+    try:
+        for name in os.listdir(root_path):
+            full_path = os.path.join(root_path, name)
+            if os.path.isdir(full_path):
+                project_id = get_or_create_project(full_path)
+                entries.append(get_project(project_id))
+    except Exception:
+        pass
+    entries.sort(key=lambda p: (not p["pinned"], p["name"].lower()))
+    return entries
+
+
+def list_conversations(limit: int = 50) -> list:
+    """Returns recent STANDALONE conversations (not tied to a project),
+    pinned ones first then most recently active - what populates the
+    sidebar's Chats list. Project conversations show up under Projects
+    instead, not duplicated here."""
+    conn = sqlite3.connect(DB_PATH)
+    rows = conn.execute(
+        "SELECT id, title, updated_at, pinned FROM conversations "
+        "WHERE project_id IS NULL ORDER BY pinned DESC, updated_at DESC LIMIT ?",
+        (limit,),
+    ).fetchall()
+    conn.close()
+    return [{"id": r[0], "title": r[1], "updated_at": r[2], "pinned": bool(r[3])} for r in rows]
+
+
+def rename_conversation(conversation_id: int, new_title: str):
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute("UPDATE conversations SET title = ? WHERE id = ?", (new_title, conversation_id))
+    conn.commit()
+    conn.close()
+
+
+def delete_conversation(conversation_id: int):
+    """Deletes a chat and its messages from ORACLE's memory. This only
+    ever touches ORACLE's own database - never any files on your
+    computer, even for project-linked conversations."""
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute("DELETE FROM messages WHERE conversation_id = ?", (conversation_id,))
+    conn.execute("DELETE FROM conversations WHERE id = ?", (conversation_id,))
+    conn.commit()
+    conn.close()
+
+
+def toggle_pin_conversation(conversation_id: int) -> bool:
+    """Flips a conversation's pinned state, returns the new state."""
+    conn = sqlite3.connect(DB_PATH)
+    row = conn.execute("SELECT pinned FROM conversations WHERE id = ?", (conversation_id,)).fetchone()
+    new_state = 0 if (row and row[0]) else 1
+    conn.execute("UPDATE conversations SET pinned = ? WHERE id = ?", (new_state, conversation_id))
+    conn.commit()
+    conn.close()
+    return bool(new_state)
+
+
+def rename_project(project_id: int, new_name: str):
+    """Renames a project's DISPLAY name only - never touches the actual
+    folder on disk. The folder path stays exactly what it was; only how
+    it's labeled in ORACLE's sidebar changes."""
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute("UPDATE projects SET name = ? WHERE id = ?", (new_name, project_id))
+    conn.commit()
+    conn.close()
+
+
+def delete_project(project_id: int):
+    """Removes a project from ORACLE's tracking - its conversation memory
+    is deleted from ORACLE's database, but the actual project folder and
+    every file in it are completely untouched. Re-opening the same folder
+    later would simply start it fresh, as if new."""
+    conn = sqlite3.connect(DB_PATH)
+    conv_ids = [r[0] for r in conn.execute(
+        "SELECT id FROM conversations WHERE project_id = ?", (project_id,)
+    ).fetchall()]
+    for conv_id in conv_ids:
+        conn.execute("DELETE FROM messages WHERE conversation_id = ?", (conv_id,))
+        conn.execute("DELETE FROM conversations WHERE id = ?", (conv_id,))
+    conn.execute("DELETE FROM projects WHERE id = ?", (project_id,))
+    conn.commit()
+    conn.close()
+
+
+def toggle_pin_project(project_id: int) -> bool:
+    """Flips a project's pinned state, returns the new state."""
+    conn = sqlite3.connect(DB_PATH)
+    row = conn.execute("SELECT pinned FROM projects WHERE id = ?", (project_id,)).fetchone()
+    new_state = 0 if (row and row[0]) else 1
+    conn.execute("UPDATE projects SET pinned = ? WHERE id = ?", (new_state, project_id))
+    conn.commit()
+    conn.close()
+    return bool(new_state)
+
+
+def load_conversation_messages(conversation_id: int) -> list:
+    """Loads every message belonging to one conversation thread, in
+    order - used when reopening a past chat from the sidebar. Unlike
+    load_recent_history below, this isn't trimmed to a tail window, since
+    a thread reopened from the sidebar should load in full."""
+    conn = sqlite3.connect(DB_PATH)
+    rows = conn.execute(
+        "SELECT role, content, tool_calls, tool_call_id FROM messages "
+        "WHERE conversation_id = ? ORDER BY id ASC",
+        (conversation_id,),
+    ).fetchall()
+    conn.close()
+
+    history = []
+    for role, content, tool_calls_json, tool_call_id in rows:
+        msg = {"role": role, "content": content}
+        if tool_calls_json:
+            msg["tool_calls"] = json.loads(tool_calls_json)
+        if tool_call_id:
+            msg["tool_call_id"] = tool_call_id
+        history.append(msg)
+    return history
+
+
+def save_message(message: dict, conversation_id: int = None):
+    """Appends a single message to the database, tagged to whichever
+    conversation thread it belongs to, and bumps that conversation's
+    updated_at so the sidebar sorts by most-recently-active."""
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute(
+        "INSERT INTO messages (conversation_id, role, content, tool_calls, tool_call_id, timestamp) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
         (
+            conversation_id,
             message.get("role"),
             message.get("content"),
             # tool_calls is a list/dict - SQLite only stores text/numbers/blobs,
@@ -137,13 +397,21 @@ def save_message(message: dict):
             datetime.now().isoformat(),
         ),
     )
+    if conversation_id is not None:
+        conn.execute(
+            "UPDATE conversations SET updated_at = ? WHERE id = ?",
+            (datetime.now().isoformat(), conversation_id),
+        )
     conn.commit()
     conn.close()
 
 
 def load_recent_history(limit: int = MAX_HISTORY_MESSAGES) -> list:
-    """Loads the most recent `limit` messages from disk, oldest first, so
-    ORACLE picks up roughly where the last session left off."""
+    """Loads the most recent `limit` messages from disk, regardless of
+    conversation thread - kept for the terminal test-mode fallback at the
+    bottom of this file (`python core.py`), which doesn't have the concept
+    of separate threads. The real GUI app uses load_conversation_messages
+    instead."""
     conn = sqlite3.connect(DB_PATH)
     rows = conn.execute(
         "SELECT role, content, tool_calls, tool_call_id FROM messages "
@@ -500,13 +768,19 @@ def web_search(query: str) -> str:
 # CODING AGENT: a scoped, single-tool version of "an agent for coding" -
 # not a separate multi-agent framework, just ORACLE's main model
 # delegating coding-heavy requests to a coding-specialist model when it
-# judges that's a better fit than answering directly itself. Uses Kimi K2
-# (moonshotai/kimi-k2-instruct), which is on Groq's genuinely free tier
-# and specifically tagged for coding use cases - same client, same API
-# key as everything else, no new account or setup needed.
+# judges that's a better fit than answering directly itself.
+#
+# Uses Qwen3.6-27B (qwen/qwen3.6-27b) - same Groq client, same free
+# rate-limited developer tier, no new account or setup needed. This was
+# originally Kimi K2, but Groq fully deprecated that model (twice - first
+# the original, then its successor) as of April 2026, so it's no longer
+# available at all. Worth knowing: Groq retires and replaces models on an
+# ongoing basis, so this model ID may itself need updating again someday -
+# check https://console.groq.com/docs/deprecations if this ever starts
+# erroring with a 404.
 # ---------------------------------------------------------------------------
 
-CODING_MODEL = "moonshotai/kimi-k2-instruct"
+CODING_MODEL = "qwen/qwen3.6-27b"
 CODING_AGENT_SYSTEM_PROMPT = (
     "You are an expert coding assistant. Provide clean, correct, well-explained "
     "code and precise technical answers to programming questions. Explain your "
@@ -518,7 +792,7 @@ CODING_AGENT_SYSTEM_PROMPT = (
 def ask_coding_agent(prompt: str) -> str:
     """
     Delegates a coding-focused question or task to a coding-specialist model
-    (Kimi K2) rather than answering it directly - use this for non-trivial
+    (Qwen3.6-27B) rather than answering it directly - use this for non-trivial
     coding help: writing code, debugging, explaining code, architecture
     questions. Pass the specific coding question/task as the prompt; this
     doesn't have access to the rest of the conversation, so include
@@ -536,6 +810,235 @@ def ask_coding_agent(prompt: str) -> str:
         return response.choices[0].message.content
     except Exception as e:
         return f"Error consulting coding agent: {e}"
+
+
+# ---------------------------------------------------------------------------
+# PROJECTS: a separate, restricted tool-calling loop for the coding agent
+# when working within a specific project folder. Unlike ask_coding_agent
+# above (stateless, no tools, no file access), this gives it real
+# read/write access to files - but ONLY within the selected project's own
+# folder. Path-traversal protection (_safe_project_path) is the important
+# part here: every file tool call is validated to resolve to somewhere
+# genuinely inside the project root before touching disk, so a
+# hallucinated or malicious path like "../../../Desktop/important.txt"
+# gets refused rather than silently escaping the sandbox.
+# ---------------------------------------------------------------------------
+
+PROJECT_TOOLS_SCHEMA = [
+    {
+        "type": "function",
+        "function": {
+            "name": "list_project_files",
+            "description": "List files and folders within the current project (or a subdirectory of it).",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "directory": {
+                        "type": "string",
+                        "description": "Subdirectory within the project to list, relative to the project root. Defaults to the project root itself.",
+                    }
+                },
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "read_project_file",
+            "description": "Read the contents of a file within the current project.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "Path to the file, relative to the project root."}
+                },
+                "required": ["path"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "write_project_file",
+            "description": (
+                "Create or overwrite a file within the current project with the given "
+                "content. Unlike the general assistant's create_file, this CAN overwrite "
+                "an existing file - normal for iterative coding work."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "Path to the file, relative to the project root."},
+                    "content": {"type": "string", "description": "Full content to write to the file."},
+                },
+                "required": ["path", "content"],
+            },
+        },
+    },
+]
+
+
+def _safe_project_path(project_root: str, relative_path: str) -> str:
+    """
+    Resolves relative_path against project_root and verifies the result
+    is genuinely still inside project_root, raising if not. This is the
+    entire safety boundary for the project coding agent's file access -
+    every read/write goes through this first.
+    """
+    root_abs = os.path.abspath(project_root)
+    target_abs = os.path.abspath(os.path.join(root_abs, relative_path or "."))
+    if target_abs != root_abs and not target_abs.startswith(root_abs + os.sep):
+        raise ValueError(
+            f"'{relative_path}' resolves outside the project folder - refused for safety."
+        )
+    return target_abs
+
+
+def _make_project_tools(project_root: str) -> dict:
+    """Builds the three project-scoped tool functions as closures over a
+    specific project_root, so each project conversation gets its own
+    correctly-sandboxed set - these are never shared globally like the
+    main AVAILABLE_FUNCTIONS dict."""
+
+    def project_list_files(directory: str = ".") -> str:
+        try:
+            safe_dir = _safe_project_path(project_root, directory)
+        except ValueError as e:
+            return f"Error: {e}"
+        return list_files(safe_dir)
+
+    def project_read_file(path: str) -> str:
+        try:
+            safe_path = _safe_project_path(project_root, path)
+        except ValueError as e:
+            return f"Error: {e}"
+
+        if not os.path.isfile(safe_path):
+            return f"Error: '{path}' does not exist or is not a file."
+
+        ext = os.path.splitext(safe_path)[1].lower()
+        try:
+            if ext == ".pdf":
+                from pypdf import PdfReader
+                reader = PdfReader(safe_path)
+                text = "\n".join(page.extract_text() or "" for page in reader.pages)
+            elif ext == ".docx":
+                from docx import Document
+                doc = Document(safe_path)
+                text = "\n".join(p.text for p in doc.paragraphs)
+            else:
+                # Any other extension - source code, config, markup,
+                # whatever - reads as plain text. Unlike the general
+                # assistant's read_file (which whitelists a handful of
+                # document types), project files are overwhelmingly
+                # source code, so this needs to be permissive rather
+                # than restrictive.
+                with open(safe_path, "r", encoding="utf-8", errors="replace") as f:
+                    text = f.read()
+        except Exception as e:
+            return f"Error reading '{path}': {e}"
+
+        if not text.strip():
+            return f"'{path}' appears to be empty."
+
+        if len(text) > MAX_FILE_CHARS:
+            return f"{text[:MAX_FILE_CHARS]}\n\n(truncated - showing first {MAX_FILE_CHARS} of {len(text)} characters)"
+        return text
+
+    def project_write_file(path: str, content: str) -> str:
+        try:
+            safe_path = _safe_project_path(project_root, path)
+        except ValueError as e:
+            return f"Error: {e}"
+        try:
+            parent = os.path.dirname(safe_path)
+            if parent:
+                os.makedirs(parent, exist_ok=True)
+            with open(safe_path, "w", encoding="utf-8") as f:
+                f.write(content)
+            return f"Wrote '{path}'."
+        except Exception as e:
+            return f"Error writing '{path}': {e}"
+
+    return {
+        "list_project_files": project_list_files,
+        "read_project_file": project_read_file,
+        "write_project_file": project_write_file,
+    }
+
+
+def run_project_conversation(user_input: str, history: list, conversation_id: int, project_root: str) -> str:
+    """
+    Like run_conversation, but scoped to one project: uses the coding
+    specialist model, the restricted file-only tool set above (sandboxed
+    to project_root), and its own conversation thread - completely
+    isolated from Main Chat and every other project's memory.
+    """
+    project_tools = _make_project_tools(project_root)
+
+    history[:] = trim_history(history)
+    user_msg = {"role": "user", "content": user_input}
+    history.append(user_msg)
+    save_message(user_msg, conversation_id)
+
+    for _ in range(MAX_TOOL_ROUNDS):
+        response = client.chat.completions.create(
+            model=CODING_MODEL,
+            messages=history,
+            tools=PROJECT_TOOLS_SCHEMA,
+        )
+        message = response.choices[0].message
+
+        if not message.tool_calls:
+            final_msg = {"role": "assistant", "content": message.content}
+            history.append(final_msg)
+            save_message(final_msg, conversation_id)
+            return message.content
+
+        tool_call_msg = {
+            "role": "assistant",
+            "content": message.content,
+            "tool_calls": [
+                {
+                    "id": tc.id,
+                    "type": "function",
+                    "function": {"name": tc.function.name, "arguments": tc.function.arguments},
+                }
+                for tc in message.tool_calls
+            ],
+        }
+        history.append(tool_call_msg)
+        save_message(tool_call_msg, conversation_id)
+
+        for tool_call in message.tool_calls:
+            fn_name = tool_call.function.name
+            fn_args = json.loads(tool_call.function.arguments)
+            fn = project_tools.get(fn_name)
+            result = fn(**fn_args) if fn else f"Unknown tool: {fn_name}"
+            tool_result_msg = {
+                "role": "tool",
+                "tool_call_id": tool_call.id,
+                "content": str(result),
+            }
+            history.append(tool_result_msg)
+            save_message(tool_result_msg, conversation_id)
+
+    give_up = f"I kept calling tools without reaching an answer ({MAX_TOOL_ROUNDS} rounds)."
+    give_up_msg = {"role": "assistant", "content": give_up}
+    history.append(give_up_msg)
+    save_message(give_up_msg, conversation_id)
+    return give_up
+
+
+def project_system_prompt(project_name: str) -> str:
+    """System prompt for a project conversation - same coding-specialist
+    persona, plus explicit awareness of which project it's scoped to."""
+    return (
+        CODING_AGENT_SYSTEM_PROMPT
+        + f" You are currently working within the '{project_name}' project folder. Use "
+        "list_project_files, read_project_file, and write_project_file to explore and "
+        "modify files there - these tools are sandboxed to this project only and cannot "
+        "read or write anything outside it, even if asked."
+    )
 
 
 def open_web_search(query: str) -> str:
@@ -777,116 +1280,6 @@ def listen_and_transcribe() -> str:
 
     return text if text else "Error: could not understand the audio."
 
-
-# ---------------------------------------------------------------------------
-# WAKE WORD: no free pretrained wake-word engine (openWakeWord, Porcupine,
-# etc.) ships with an arbitrary custom word like "oracle" - those need a
-# real training pipeline with audio data, which isn't practical to set up
-# here. Instead, this continuously transcribes short rolling windows of
-# audio with our existing Whisper model and checks the text for the word.
-#
-# Honest trade-off: this is meaningfully more CPU-hungry running
-# continuously than a dedicated lightweight wake-word model would be
-# (those typically use <1% CPU; ours periodically runs real speech
-# recognition). Using the smallest "tiny" Whisper model specifically for
-# this constant background check - separate from the more accurate "base"
-# model used for actual commands - keeps that cost as low as reasonably
-# possible while still working for a custom word with zero training.
-# ---------------------------------------------------------------------------
-
-WAKE_WORD = "oracle"
-WAKE_WHISPER_MODEL_SIZE = "tiny"
-WAKE_WINDOW_SEC = 3.0          # how much recent audio is checked each time
-WAKE_CHECK_INTERVAL_SEC = 1.5  # how often to check (creates overlap with the
-                                # window above, so the word isn't missed if
-                                # it lands right on a boundary)
-WAKE_CHUNK_SEC = 0.5           # size of each buffered audio chunk
-
-_wake_whisper_model = None
-_wake_buffer = collections.deque(maxlen=int(WAKE_WINDOW_SEC / WAKE_CHUNK_SEC))
-_wake_buffer_lock = threading.Lock()
-_wake_stream = None
-
-
-def _get_wake_whisper_model():
-    """Separate, smaller model instance from the one used for actual
-    command transcription - see the module-level comment above for why."""
-    global _wake_whisper_model
-    if _wake_whisper_model is None:
-        from faster_whisper import WhisperModel
-        _wake_whisper_model = WhisperModel(WAKE_WHISPER_MODEL_SIZE, device="cpu", compute_type="int8")
-    return _wake_whisper_model
-
-
-def _wake_callback(indata, frame_count, time_info, status):
-    with _wake_buffer_lock:
-        _wake_buffer.append(indata.copy())
-
-
-def start_wake_word_stream() -> str:
-    """Starts the continuous background microphone stream that feeds the
-    rolling buffer check_for_wake_word() reads from."""
-    global _wake_stream
-    if _wake_stream is not None:
-        return "Already listening for wake word."
-    try:
-        _wake_stream = sd.InputStream(
-            samplerate=SAMPLE_RATE,
-            channels=1,
-            dtype="float32",
-            blocksize=int(SAMPLE_RATE * WAKE_CHUNK_SEC),
-            callback=_wake_callback,
-        )
-        _wake_stream.start()
-        return "Wake word listening started."
-    except Exception as e:
-        _wake_stream = None
-        return f"Error starting wake word stream: {e}"
-
-
-def stop_wake_word_stream():
-    """Stops the wake-word background stream - used while a voice turn is
-    actively being handled, so the mic isn't fought over by two streams
-    at once and so the buffer doesn't re-trigger on residual audio."""
-    global _wake_stream
-    if _wake_stream is not None:
-        try:
-            _wake_stream.stop()
-            _wake_stream.close()
-        except Exception:
-            pass
-        _wake_stream = None
-    with _wake_buffer_lock:
-        _wake_buffer.clear()
-
-
-def check_for_wake_word() -> bool:
-    """
-    Transcribes whatever's currently in the rolling buffer and checks for
-    the wake word. Called periodically (see run_wake_word_listener in
-    ui.py) rather than continuously, since running Whisper truly
-    non-stop would be excessive - the WAKE_CHECK_INTERVAL_SEC gap plus
-    the buffer's overlap is the balance between catching the word
-    promptly and not pegging the CPU constantly.
-    """
-    with _wake_buffer_lock:
-        if not _wake_buffer:
-            return False
-        audio = np.concatenate(list(_wake_buffer), axis=0).flatten()
-
-    # Cheap check before bothering Whisper at all - skip near-silent windows.
-    if np.abs(audio).mean() < 0.001:
-        return False
-
-    try:
-        model = _get_wake_whisper_model()
-        segments, _ = model.transcribe(audio, language=None)
-        text = " ".join(segment.text for segment in segments).lower()
-    except Exception:
-        return False
-
-    cleaned = re.sub(r"[^a-z\s]", "", text)
-    return WAKE_WORD in cleaned
 
 
 # ---------------------------------------------------------------------------
@@ -1857,16 +2250,18 @@ def trim_history(history: list) -> list:
     return system_msgs + trimmed
 
 
-def run_conversation(user_input: str, history: list) -> str:
+def run_conversation(user_input: str, history: list, conversation_id: int = None) -> str:
     """
     Sends the user's message + history to the model. The model may need several
     rounds of tool calls - each result can prompt the next call - so we keep
-    going until it returns a plain text answer.
+    going until it returns a plain text answer. conversation_id tags every
+    saved message to the right thread so it shows up correctly if this
+    conversation is reopened later from the sidebar.
     """
     history[:] = trim_history(history)
     user_msg = {"role": "user", "content": user_input}
     history.append(user_msg)
-    save_message(user_msg)
+    save_message(user_msg, conversation_id)
 
     for _ in range(MAX_TOOL_ROUNDS):
         response = client.chat.completions.create(
@@ -1881,7 +2276,7 @@ def run_conversation(user_input: str, history: list) -> str:
         if not message.tool_calls:
             final_msg = {"role": "assistant", "content": message.content}
             history.append(final_msg)
-            save_message(final_msg)
+            save_message(final_msg, conversation_id)
             return message.content
 
         # Record the assistant's tool-call request in history. We build this
@@ -1905,7 +2300,7 @@ def run_conversation(user_input: str, history: list) -> str:
             ],
         }
         history.append(tool_call_msg)
-        save_message(tool_call_msg)
+        save_message(tool_call_msg, conversation_id)
 
         for tool_call in message.tool_calls:
             fn_name = tool_call.function.name
@@ -1924,27 +2319,24 @@ def run_conversation(user_input: str, history: list) -> str:
                 "content": str(result),
             }
             history.append(tool_result_msg)
-            save_message(tool_result_msg)
+            save_message(tool_result_msg, conversation_id)
 
     give_up = f"I kept calling tools without reaching an answer ({MAX_TOOL_ROUNDS} rounds). Try asking a narrower question."
     give_up_msg = {"role": "assistant", "content": give_up}
     history.append(give_up_msg)
-    save_message(give_up_msg)
+    save_message(give_up_msg, conversation_id)
     return give_up
 
 
 def generate_wake_greeting() -> str:
     """
-    One-off, lightweight LLM call for a short greeting spoken when the
-    wake word activates ORACLE - deliberately NOT run through
-    run_conversation/tools, since a greeting never needs a tool and this
-    keeps activation to a single fast API call instead of a full
-    tool-calling round trip. Explicitly asked to vary its phrasing each
-    time rather than reusing the same line on every activation.
+    Kept in case wake-word or a similar hands-free activation trigger
+    comes back later - not currently called anywhere, since clicking the
+    HUD ring goes straight to listening without a greeting step.
     """
     prompt = (
         f"The current time is {get_current_time()}. The user (whom you address as "
-        f"'{USER_NAME}') just activated you with your wake word. Greet them by name "
+        f"'{USER_NAME}') just activated you. Greet them by name "
         "in one short, natural sentence, in character as established in your system "
         "prompt - calm, dry-witted, quietly loyal. Vary your phrasing meaningfully "
         "each time rather than repeating a fixed template - not a generic "
@@ -1980,4 +2372,4 @@ if __name__ == "__main__":
         if user_text.lower() in ("quit", "exit"):
             break
         reply = run_conversation(user_text, conversation_history)
-        print(f"ORACLE: {reply}\n") 
+        print(f"ORACLE: {reply}\n")

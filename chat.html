@@ -341,7 +341,7 @@
   }
 
   // Note: this never triggers speech. Typed/chat-window conversations stay
-  // text-only on purpose - only the wake-word voice flow (driven from
+  // text-only on purpose - only the ring-click voice flow (driven from
   // ui.py's _wake_turn, into the separate HUD window) speaks out loud.
   async function sendMessage(text) {
     text = (text !== undefined ? text : input.value).trim();
