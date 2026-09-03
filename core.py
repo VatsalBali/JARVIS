@@ -140,6 +140,17 @@ def init_db():
             value TEXT
         )
     """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS bugs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            title TEXT NOT NULL,
+            description TEXT,
+            project_path TEXT,
+            status TEXT NOT NULL DEFAULT 'open',
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )
+    """)
     # Migration: a DB created before conversation threading existed won't
     # have this column - old messages just end up with conversation_id
     # NULL (not deleted, just invisible to the new per-thread sidebar).
@@ -154,6 +165,12 @@ def init_db():
         conn.execute("ALTER TABLE conversations ADD COLUMN project_id INTEGER")
     if "pinned" not in conv_cols:
         conn.execute("ALTER TABLE conversations ADD COLUMN pinned INTEGER DEFAULT 0")
+    # Migration: agent-scoped conversations (Phase 3). Existing rows predate
+    # multi-agent mode entirely, so they're backfilled as "main" - the
+    # agent that was, in effect, the only one with real memory before this.
+    if "agent" not in conv_cols:
+        conn.execute("ALTER TABLE conversations ADD COLUMN agent TEXT DEFAULT 'main'")
+        conn.execute("UPDATE conversations SET agent = 'main' WHERE agent IS NULL")
 
     proj_cols = [row[1] for row in conn.execute("PRAGMA table_info(projects)").fetchall()]
     if "pinned" not in proj_cols:
@@ -163,13 +180,16 @@ def init_db():
     conn.close()
 
 
-def create_conversation(first_message: str, project_id: int = None) -> int:
+def create_conversation(first_message: str, project_id: int = None, agent: str = "main") -> int:
     """
     Starts a new conversation thread, titled from a truncated version of
     its first message (simple and free - no extra LLM call just to name
     a chat). If project_id is given, this thread is tied to that project
-    rather than being a regular standalone chat. Returns the new
-    conversation's ID.
+    rather than being a regular standalone chat. agent tags which agent
+    "owns" this thread ("main" or "coding" so far) - drives which
+    sidebar list it shows up in and, once each agent gets its own real
+    memory, which system prompt/history it resumes with. Returns the
+    new conversation's ID.
     """
     title = first_message.strip().replace("\n", " ")[:50]
     if len(first_message.strip()) > 50:
@@ -177,8 +197,8 @@ def create_conversation(first_message: str, project_id: int = None) -> int:
     now = datetime.now().isoformat()
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.execute(
-        "INSERT INTO conversations (title, created_at, updated_at, project_id) VALUES (?, ?, ?, ?)",
-        (title, now, now, project_id),
+        "INSERT INTO conversations (title, created_at, updated_at, project_id, agent) VALUES (?, ?, ?, ?, ?)",
+        (title, now, now, project_id, agent),
     )
     conn.commit()
     conversation_id = cursor.lastrowid
@@ -272,19 +292,41 @@ def list_projects_in_root(root_path: str) -> list:
     return entries
 
 
-def list_conversations(limit: int = 50) -> list:
+def list_conversations(limit: int = 50, agent: str = None) -> list:
     """Returns recent STANDALONE conversations (not tied to a project),
     pinned ones first then most recently active - what populates the
     sidebar's Chats list. Project conversations show up under Projects
-    instead, not duplicated here."""
+    instead, not duplicated here. When agent is given, only that agent's
+    threads are returned - each agent gets its own scoped sidebar."""
     conn = sqlite3.connect(DB_PATH)
-    rows = conn.execute(
-        "SELECT id, title, updated_at, pinned FROM conversations "
-        "WHERE project_id IS NULL ORDER BY pinned DESC, updated_at DESC LIMIT ?",
-        (limit,),
-    ).fetchall()
+    if agent is not None:
+        rows = conn.execute(
+            "SELECT id, title, updated_at, pinned FROM conversations "
+            "WHERE project_id IS NULL AND agent = ? "
+            "ORDER BY pinned DESC, updated_at DESC LIMIT ?",
+            (agent, limit),
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            "SELECT id, title, updated_at, pinned FROM conversations "
+            "WHERE project_id IS NULL ORDER BY pinned DESC, updated_at DESC LIMIT ?",
+            (limit,),
+        ).fetchall()
     conn.close()
     return [{"id": r[0], "title": r[1], "updated_at": r[2], "pinned": bool(r[3])} for r in rows]
+
+
+def get_conversation_agent(conversation_id: int) -> str:
+    """Looks up which agent owns a given conversation thread - used when
+    reopening a chat from the sidebar, so switching into it also switches
+    the active agent (and therefore the system prompt/mode) to match,
+    rather than leaving them out of sync."""
+    conn = sqlite3.connect(DB_PATH)
+    row = conn.execute(
+        "SELECT agent FROM conversations WHERE id = ?", (conversation_id,)
+    ).fetchone()
+    conn.close()
+    return row[0] if row and row[0] else "main"
 
 
 def rename_conversation(conversation_id: int, new_title: str):
@@ -781,11 +823,46 @@ def web_search(query: str) -> str:
 # ---------------------------------------------------------------------------
 
 CODING_MODEL = "qwen/qwen3.6-27b"
-CODING_AGENT_SYSTEM_PROMPT = (
+
+# Used by ask_coding_agent (below) - the stateless, tool-free one-shot
+# delegate Main can call mid-conversation. Deliberately does NOT mention
+# any tools, since this call path has none - telling it about
+# run_shell_command/run_sql_query/etc. here would just invite it to
+# reference capabilities it doesn't actually have access to.
+CODING_DELEGATE_SYSTEM_PROMPT = (
     "You are an expert coding assistant. Provide clean, correct, well-explained "
     "code and precise technical answers to programming questions. Explain your "
     "reasoning where it genuinely helps understanding, but don't pad answers with "
     "unnecessary chatter - the person asking wants a working answer."
+)
+
+# Used by run_coding_conversation (the persistent, stateful Coding agent
+# mode) - this one DOES have real tool access, so the prompt describes it.
+CODING_AGENT_SYSTEM_PROMPT = (
+    "You are ORACLE's Coding agent - an expert coding assistant with real "
+    "tool access: reading/writing/moving files anywhere on the local "
+    "machine, running shell commands (git, docker, package managers, "
+    "linters, test runners, network diagnostics, log inspection - "
+    "run_shell_command), executing SQL against SQLite databases "
+    "(run_sql_query), and tracking known issues (create_bug/list_bugs/"
+    "update_bug_status). Use list_tracked_projects to see all of V's "
+    "tracked projects and their paths when asked to check, review, or "
+    "compare something across multiple/all projects - then iterate them "
+    "one by one with the file/shell tools, using each project's path as "
+    "the working directory.\n\n"
+    "You're expected to handle, as ordinary requests (not just when "
+    "explicitly named): code review and architecture review (read the "
+    "relevant files, give a real critique - correctness, structure, "
+    "risk, not just style nitpicks), writing tests for existing code, "
+    "and writing documentation (READMEs, docstrings, API docs) - all of "
+    "these are done with your existing read_file/create_file tools, not "
+    "separate commands. For anything destructive (force-pushes, hard "
+    "resets, dropping tables, deleting containers/volumes), say what "
+    "you're about to do before doing it.\n\n"
+    "Provide clean, correct, well-explained code and precise technical "
+    "answers. Explain your reasoning where it genuinely helps "
+    "understanding, but don't pad answers with unnecessary chatter - "
+    "the person asking wants a working answer."
 )
 
 
@@ -798,18 +875,302 @@ def ask_coding_agent(prompt: str) -> str:
     doesn't have access to the rest of the conversation, so include
     whatever context (language, relevant code, error messages) is actually
     needed to answer well.
+
+    This is Main's tool for a quick, single-shot coding question without
+    leaving Main mode - kept deliberately stateless for that purpose. For
+    an actual ongoing Coding session with memory and tool access across
+    turns, see run_coding_conversation below (used by the persistent
+    Coding agent mode, via switch_agent).
     """
     try:
         response = client.chat.completions.create(
             model=CODING_MODEL,
             messages=[
-                {"role": "system", "content": CODING_AGENT_SYSTEM_PROMPT},
+                {"role": "system", "content": CODING_DELEGATE_SYSTEM_PROMPT},
                 {"role": "user", "content": prompt},
             ],
         )
         return response.choices[0].message.content
     except Exception as e:
         return f"Error consulting coding agent: {e}"
+
+
+def run_coding_conversation(user_input: str, history: list, conversation_id: int = None) -> str:
+    """
+    Stateful counterpart to ask_coding_agent - the persistent Coding
+    *agent* (as opposed to Main's one-shot delegation tool above). Same
+    multi-round tool-calling shape as run_conversation, just pointed at
+    CODING_MODEL/CODING_AGENT_SYSTEM_PROMPT instead: the Coding agent now
+    actually remembers prior turns, tool results, and context across a
+    session rather than treating every message as an isolated call.
+
+    Shares TOOLS/AVAILABLE_FUNCTIONS with Main for now - there's no
+    Coding-specific toolset yet (git assistant, Docker, CI/CD monitoring,
+    etc. are still backlog items). Worth knowing: this loop is
+    near-identical to run_conversation's, duplicated rather than shared
+    via a common helper - a reasonable refactor once a third stateful
+    agent (Learning, Information Management) needs the same loop, but
+    not done preemptively here to keep this change's blast radius small.
+    """
+    history[:] = trim_history(history)
+    user_msg = {"role": "user", "content": user_input}
+    history.append(user_msg)
+    save_message(user_msg, conversation_id)
+
+    for _ in range(MAX_TOOL_ROUNDS):
+        response = client.chat.completions.create(
+            model=CODING_MODEL,
+            messages=history,
+            tools=CODING_TOOLS,
+        )
+
+        message = response.choices[0].message
+
+        if not message.tool_calls:
+            final_msg = {"role": "assistant", "content": message.content}
+            history.append(final_msg)
+            save_message(final_msg, conversation_id)
+            return message.content
+
+        # Built manually rather than via message.model_dump() - same reason
+        # as run_conversation: the full dump includes extra fields (like
+        # "annotations") the API accepts on the way out but rejects on the
+        # way back in.
+        tool_call_msg = {
+            "role": "assistant",
+            "content": message.content,
+            "tool_calls": [
+                {
+                    "id": tc.id,
+                    "type": "function",
+                    "function": {
+                        "name": tc.function.name,
+                        "arguments": tc.function.arguments,
+                    },
+                }
+                for tc in message.tool_calls
+            ],
+        }
+        history.append(tool_call_msg)
+        save_message(tool_call_msg, conversation_id)
+
+        for tool_call in message.tool_calls:
+            fn_name = tool_call.function.name
+            fn_args = json.loads(tool_call.function.arguments)
+
+            fn = CODING_AVAILABLE_FUNCTIONS.get(fn_name)
+            result = fn(**fn_args) if fn else f"Unknown tool: {fn_name}"
+
+            tool_result_msg = {
+                "role": "tool",
+                "tool_call_id": tool_call.id,
+                "content": str(result),
+            }
+            history.append(tool_result_msg)
+            save_message(tool_result_msg, conversation_id)
+
+    give_up = f"I kept calling tools without reaching an answer ({MAX_TOOL_ROUNDS} rounds). Try asking a narrower question."
+    give_up_msg = {"role": "assistant", "content": give_up}
+    history.append(give_up_msg)
+    save_message(give_up_msg, conversation_id)
+    return give_up
+
+
+# ---------------------------------------------------------------------------
+# CODING AGENT EXPANSION: tools available ONLY in Coding mode, not Main -
+# see CODING_TOOLS/CODING_AVAILABLE_FUNCTIONS near the bottom of this file,
+# where these get merged with the shared TOOLS/AVAILABLE_FUNCTIONS.
+#
+# This covers most of the original 17-item backlog (git assistant, Docker,
+# Linux/system admin, network diagnostics, CI/CD monitoring, log analysis,
+# security checks, performance profiling) with ONE guarded command runner
+# rather than 8 separate wrappers - those are all fundamentally "run a CLI
+# command, read the output" once you look past the label. Database
+# design/SQL generation gets a real SQL execution tool instead (so
+# generated SQL can actually be tested, not just written blind). Bug
+# tracker gets its own small table/tools, since it's a genuinely distinct
+# feature. Code review, architecture review, test generation, and
+# documentation/API docs are NOT separate tools - they're reasoning +
+# read_file/create_file, which Coding already has; CODING_AGENT_SYSTEM_PROMPT
+# below is updated to actually call these use cases out.
+# ---------------------------------------------------------------------------
+
+# Command-line runner is powerful by nature - this is a personal,
+# single-user desktop assistant (same trust model as delete_file /
+# move_file, which already exist), not a shared or multi-tenant service,
+# so a general command runner is consistent with what ORACLE already
+# allows. Still worth a hard blocklist for the handful of commands that
+# are essentially unrecoverable regardless of trust model.
+_SHELL_COMMAND_TIMEOUT_SEC = 60
+_SHELL_BLOCKED_PATTERNS = [
+    "format ", "diskpart", "shutdown", "vssadmin", "bcdedit",
+    "rm -rf /", "rm -rf *", "del /f /s /q c:\\", "del /f /s /q c:/",
+    "mkfs", ":(){:|:&};:",  # fork bomb
+]
+
+
+def run_shell_command(command: str, cwd: str = None) -> str:
+    """
+    Runs a command-line command (git, docker, npm, pip, ping, netstat,
+    tasklist, findstr/grep over log files, etc.) and returns its output.
+    Use this for anything that's naturally a CLI operation: git status/
+    diff/commit, docker ps/logs, checking installed package versions,
+    network diagnostics, tailing/searching log files, running a linter
+    or test suite, checking a CI tool's CLI (e.g. `gh run list`), and so
+    on - rather than trying to reimplement any of that by hand.
+
+    cwd optionally sets the working directory (e.g. a project's folder,
+    from list_tracked_projects) so commands like `git status` run
+    against the right repo. A small blocklist refuses a handful of
+    unrecoverable, obviously-destructive commands (disk formatting,
+    forced shutdown, etc.) - everything else is allowed, since this
+    assistant already has real file-deletion tools; use real judgment
+    before running anything destructive (force-pushes, hard resets,
+    `docker system prune`, deleting containers/volumes) even though it
+    isn't blocked outright.
+    """
+    lowered = command.lower()
+    for pattern in _SHELL_BLOCKED_PATTERNS:
+        if pattern in lowered:
+            return f"Refused: '{command}' matches a blocked destructive pattern ({pattern!r})."
+
+    try:
+        result = subprocess.run(
+            command,
+            shell=True,
+            cwd=cwd if cwd else None,
+            capture_output=True,
+            text=True,
+            timeout=_SHELL_COMMAND_TIMEOUT_SEC,
+        )
+        output = (result.stdout or "") + (result.stderr or "")
+        output = output.strip() or "(no output)"
+        # Guard against flooding the model's context with e.g. a huge log
+        # dump or verbose build output.
+        if len(output) > 8000:
+            output = output[:8000] + "\n...(truncated)"
+        return f"Exit code {result.returncode}:\n{output}"
+    except subprocess.TimeoutExpired:
+        return f"Error: command timed out after {_SHELL_COMMAND_TIMEOUT_SEC}s."
+    except Exception as e:
+        return f"Error running command: {e}"
+
+
+def run_sql_query(db_path: str, query: str) -> str:
+    """
+    Runs a SQL query against a SQLite database file and returns the
+    result - use this to actually test generated SQL (schema changes,
+    SELECTs, migrations) against a real file rather than just writing
+    it blind. Returns matched rows for SELECTs, or the affected row
+    count for INSERT/UPDATE/DELETE/DDL. Changes are committed
+    immediately - there's no separate "dry run" mode, so treat this
+    like running the query directly in a SQLite client.
+    """
+    if not os.path.isfile(db_path):
+        return f"Error: no file found at {db_path}."
+    try:
+        conn = sqlite3.connect(db_path)
+        cursor = conn.execute(query)
+        if cursor.description:  # SELECT-like - has result columns
+            columns = [d[0] for d in cursor.description]
+            rows = cursor.fetchall()
+            conn.close()
+            if not rows:
+                return "Query returned 0 rows."
+            preview = rows[:50]
+            lines = [", ".join(columns)]
+            lines += [", ".join(str(v) for v in row) for row in preview]
+            suffix = f"\n...({len(rows) - 50} more rows)" if len(rows) > 50 else ""
+            return "\n".join(lines) + suffix
+        else:
+            conn.commit()
+            affected = cursor.rowcount
+            conn.close()
+            return f"Query executed. Rows affected: {affected}."
+    except Exception as e:
+        return f"Error running query: {e}"
+
+
+def list_tracked_projects() -> str:
+    """
+    Lists all of ORACLE's tracked projects (from the configured projects
+    root folder) - use this for any "across all my projects" request
+    (e.g. "check all my projects for critical issues"): call this
+    first to get each project's path, then use list_files/read_file/
+    run_shell_command (with cwd set to each path in turn) to actually
+    iterate and inspect them one by one.
+    """
+    root = get_setting("projects_root")
+    if not root:
+        return "No projects folder has been set yet."
+    projects = list_projects_in_root(root)
+    if not projects:
+        return f"No projects found under {root}."
+    return "\n".join(f"{p['name']}: {p['path']}" for p in projects)
+
+
+# ---------------------------------------------------------------------------
+# BUG TRACKER: intentionally simple and local - no severity levels,
+# assignees, or workflows, just enough structure (title, description,
+# status, optionally tied to a project path) to be genuinely useful for
+# a solo developer tracking their own known issues across sessions.
+# ---------------------------------------------------------------------------
+
+def create_bug(title: str, description: str = "", project_path: str = None) -> str:
+    """Logs a new bug/known-issue. project_path is optional - tag it
+    with the relevant project's path (from list_tracked_projects) so
+    bugs can later be filtered per project, or leave it out for a
+    general/cross-cutting issue."""
+    now = datetime.now().isoformat()
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.execute(
+        "INSERT INTO bugs (title, description, project_path, status, created_at, updated_at) "
+        "VALUES (?, ?, ?, 'open', ?, ?)",
+        (title, description, project_path, now, now),
+    )
+    conn.commit()
+    bug_id = cursor.lastrowid
+    conn.close()
+    return f"Logged bug #{bug_id}: {title}"
+
+
+def list_bugs(project_path: str = None, status: str = None) -> str:
+    """Lists tracked bugs, optionally filtered by project_path and/or
+    status ('open', 'in_progress', 'closed'). No filters returns
+    everything, most recently updated first."""
+    conn = sqlite3.connect(DB_PATH)
+    query = "SELECT id, title, status, project_path, updated_at FROM bugs WHERE 1=1"
+    params = []
+    if project_path:
+        query += " AND project_path = ?"
+        params.append(project_path)
+    if status:
+        query += " AND status = ?"
+        params.append(status)
+    query += " ORDER BY updated_at DESC LIMIT 50"
+    rows = conn.execute(query, params).fetchall()
+    conn.close()
+    if not rows:
+        return "No matching bugs found."
+    lines = [f"#{r[0]} [{r[2]}] {r[1]}" + (f" ({r[3]})" if r[3] else "") for r in rows]
+    return "\n".join(lines)
+
+
+def update_bug_status(bug_id: int, status: str) -> str:
+    """Updates a bug's status - typically 'open', 'in_progress', or
+    'closed', but not restricted to those, so it can flex to however
+    you actually want to track it."""
+    conn = sqlite3.connect(DB_PATH)
+    now = datetime.now().isoformat()
+    cursor = conn.execute(
+        "UPDATE bugs SET status = ?, updated_at = ? WHERE id = ?", (status, now, bug_id)
+    )
+    if cursor.rowcount == 0:
+        conn.close()
+        return f"Error: no bug found with id {bug_id}."
+    conn.commit()
+    conn.close()
+    return f"Bug #{bug_id} status set to '{status}'."
 
 
 # ---------------------------------------------------------------------------
@@ -2227,6 +2588,134 @@ AVAILABLE_FUNCTIONS = {
     "send_gmail_message": send_gmail_message,
     "delete_gmail_message": delete_gmail_message,
 }
+
+
+# ---------------------------------------------------------------------------
+# CODING-ONLY TOOLS: schema entries for the Coding agent expansion
+# (run_shell_command, run_sql_query, list_tracked_projects, bug tracker -
+# implementations are defined earlier, right after run_coding_conversation).
+# Kept separate from TOOLS/AVAILABLE_FUNCTIONS above so Main does NOT get
+# shell/SQL execution access - only Coding mode does.
+# ---------------------------------------------------------------------------
+
+CODING_ONLY_TOOLS_SCHEMA = [
+    {
+        "type": "function",
+        "function": {
+            "name": "run_shell_command",
+            "description": (
+                "Run a command-line command (git, docker, npm, pip, ping, "
+                "netstat, tasklist, a linter, a test runner, etc.) and get "
+                "its output. Covers git operations, Docker management, "
+                "dependency/package checks, network diagnostics, log "
+                "searching, CI CLI tools, and performance/profiling "
+                "commands - anything that's naturally a CLI operation."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "command": {"type": "string", "description": "The full command to run, e.g. 'git status' or 'docker ps'."},
+                    "cwd": {"type": "string", "description": "Working directory to run the command in, e.g. a project's path."},
+                },
+                "required": ["command"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "run_sql_query",
+            "description": (
+                "Execute a SQL query against a SQLite database file and "
+                "get real results back - use this to test generated SQL "
+                "(schema design, migrations, SELECTs) rather than writing "
+                "it blind."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "db_path": {"type": "string", "description": "Path to the SQLite database file."},
+                    "query": {"type": "string", "description": "The SQL query to execute."},
+                },
+                "required": ["db_path", "query"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_tracked_projects",
+            "description": (
+                "List all of ORACLE's tracked projects and their folder "
+                "paths. Call this first for any request spanning multiple "
+                "or all projects (e.g. 'check all my projects for critical "
+                "issues'), then iterate the returned paths with file/shell "
+                "tools."
+            ),
+            "parameters": {"type": "object", "properties": {}},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "create_bug",
+            "description": "Log a new bug or known issue for later tracking.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "title": {"type": "string", "description": "Short summary of the bug."},
+                    "description": {"type": "string", "description": "Fuller details - repro steps, error messages, etc."},
+                    "project_path": {"type": "string", "description": "Optional - path of the project this bug belongs to."},
+                },
+                "required": ["title"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_bugs",
+            "description": "List tracked bugs, optionally filtered by project or status.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "project_path": {"type": "string", "description": "Optional - only show bugs for this project."},
+                    "status": {"type": "string", "description": "Optional - e.g. 'open', 'in_progress', 'closed'."},
+                },
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "update_bug_status",
+            "description": "Update a tracked bug's status.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "bug_id": {"type": "integer", "description": "The bug's ID, from list_bugs."},
+                    "status": {"type": "string", "description": "New status, e.g. 'open', 'in_progress', 'closed'."},
+                },
+                "required": ["bug_id", "status"],
+            },
+        },
+    },
+]
+
+CODING_ONLY_AVAILABLE_FUNCTIONS = {
+    "run_shell_command": run_shell_command,
+    "run_sql_query": run_sql_query,
+    "list_tracked_projects": list_tracked_projects,
+    "create_bug": create_bug,
+    "list_bugs": list_bugs,
+    "update_bug_status": update_bug_status,
+}
+
+# Coding gets everything Main has (file ops, web search, etc.) PLUS the
+# Coding-only tools above. Main does NOT get CODING_ONLY_TOOLS_SCHEMA back -
+# this merge is one-directional.
+CODING_TOOLS = TOOLS + CODING_ONLY_TOOLS_SCHEMA
+CODING_AVAILABLE_FUNCTIONS = {**AVAILABLE_FUNCTIONS, **CODING_ONLY_AVAILABLE_FUNCTIONS}
 
 
 def trim_history(history: list) -> list:

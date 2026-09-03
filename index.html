@@ -49,7 +49,6 @@
     display: flex;
     flex-direction: column;
     overflow: hidden;
-    -webkit-app-region: drag;
   }
 
   .sidebar-top {
@@ -215,7 +214,6 @@
     gap: 12px;
     padding: 14px 20px;
     flex-shrink: 0;
-    -webkit-app-region: drag;
   }
 
   .clock {
@@ -335,6 +333,9 @@
     outline: none;
     cursor: pointer;
     flex-shrink: 0;
+  }
+  .sidebar-top .agent-select {
+    margin-left: auto;
   }
   .agent-select:hover, .agent-select:focus { border-color: var(--accent-dim); color: var(--text); }
   .agent-select option { background: var(--panel-alt); color: var(--text); }
@@ -458,9 +459,13 @@
 <div class="shell" id="shell">
 
   <div class="sidebar" id="sidebar">
-    <div class="sidebar-top">
+    <div class="sidebar-top pywebview-drag-region">
       <span class="icon-btn" id="sidebarToggle" title="Collapse sidebar">&#9776;</span>
       <span class="brand mono">ORACLE</span>
+      <select class="agent-select" id="agentSelect" title="Active agent - stays selected until you change it">
+        <option value="main">Main</option>
+        <option value="coding">Coding</option>
+      </select>
     </div>
     <div class="sidebar-search">
       <input id="searchChats" type="text" placeholder="Search chats">
@@ -482,7 +487,7 @@
   </div>
 
   <div class="main">
-    <div class="topbar">
+    <div class="topbar pywebview-drag-region">
       <span class="clock mono" id="clock">--:--:--</span>
       <div class="top-ring-slot" id="topRingSlot"></div>
       <span class="icon-btn" id="minimizeBtn" title="Minimize">&#8211;</span>
@@ -598,10 +603,6 @@
       <h1 class="hero-greeting" id="heroGreeting">Hello</h1>
 
       <div class="hero-input-box">
-        <select class="agent-select" id="agentSelect" title="Which agent handles this message">
-          <option value="main">Main</option>
-          <option value="coding">Coding</option>
-        </select>
         <input id="heroInput" type="text" placeholder="How can I help you today?" autofocus>
         <span class="input-icon mic" id="heroMicBtn" title="Voice input">&#127908;</span>
         <span class="input-icon send" id="heroSendBtn">&#10148;</span>
@@ -716,8 +717,6 @@
     hero.style.display = 'none';
     chatView.style.display = 'grid';
     topRingSlot.appendChild(ringWrap);
-    const inputBar = document.querySelector('.input-bar');
-    inputBar.insertBefore(agentSelect, inputBar.firstChild);
     document.getElementById('input').focus();
   }
 
@@ -727,8 +726,6 @@
     hero.style.display = 'flex';
     chatView.style.display = 'none';
     heroRingSlot.appendChild(ringWrap);
-    const heroInputBox = document.querySelector('.hero-input-box');
-    heroInputBox.insertBefore(agentSelect, heroInputBox.firstChild);
     log.innerHTML = '';
     document.getElementById('heroInput').focus();
   }
@@ -779,7 +776,7 @@
     if (!text) return;
     addMessage('user', text);
     try {
-      const reply = await window.pywebview.api.send_message(text, agentSelect.value);
+      const reply = await window.pywebview.api.send_message(text);
       addMessage('jarvis', reply);
     } catch (err) {
       addMessage('jarvis', 'I encountered an error: ' + err);
@@ -876,6 +873,24 @@
   // ---- Sidebar controls ----
   document.getElementById('sidebarToggle').addEventListener('click', () => {
     shell.classList.toggle('sidebar-collapsed');
+  });
+
+  // Persistent agent switch - unlike the old per-message dropdown, this
+  // actually changes ORACLE's active mode until changed again. Mirrors
+  // "+ New chat": drops into a fresh hero state, but for the newly
+  // selected agent, and the sidebar's Chats list now shows only that
+  // agent's threads (list_conversations is agent-scoped server-side).
+  agentSelect.addEventListener('change', async () => {
+    try {
+      await window.pywebview.api.switch_agent(agentSelect.value);
+    } catch (err) {
+      console.error('switch_agent failed:', err);
+      return;
+    }
+    enterHero();
+    clearProjectModeUI();
+    activeConversationId = null;
+    refreshChatList();
   });
 
   document.getElementById('newChatBtn').addEventListener('click', async () => {
@@ -1124,19 +1139,27 @@
 
   // Project mode changes what the agent selector shows (and disables it,
   // since a project always implies coding-with-file-access regardless of
-  // manual selection) and shows which project is active near the input.
+  // manual selection). The agent that was active before entering project
+  // mode is remembered and restored on exit, rather than resetting to Main.
+  let agentBeforeProjectMode = 'main';
+
   function setProjectModeUI(projectName) {
+    agentBeforeProjectMode = agentSelect.disabled ? agentBeforeProjectMode : agentSelect.value;
     agentSelect.innerHTML = `<option value="project">Project: ${projectName}</option>`;
     agentSelect.disabled = true;
   }
 
   function clearProjectModeUI() {
     activeProjectPath = null;
+    if (!agentSelect.disabled) return; // wasn't in project mode - nothing to restore,
+                                        // and nothing to protect the user's current
+                                        // agent selection from
     agentSelect.disabled = false;
     agentSelect.innerHTML = `
       <option value="main">Main</option>
       <option value="coding">Coding</option>
     `;
+    agentSelect.value = agentBeforeProjectMode;
   }
 
   // ---- Window controls ----

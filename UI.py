@@ -33,6 +33,7 @@ import webview
 import pystray
 from PIL import Image, ImageDraw
 import core
+import gemini_voice
 
 # Module-level references so the tray thread and Api bridge can both
 # reach the same window/api objects.
@@ -107,6 +108,8 @@ class Api:
 
     def __init__(self):
         core.init_db()
+        self.current_agent = "main"  # persists until switch_agent() is called -
+                                      # replaces the old per-message agent param
         self.history = [{"role": "system", "content": core.SYSTEM_PROMPT}]
         self.current_conversation_id = None
         self.current_project_id = None
@@ -117,19 +120,46 @@ class Api:
         fresh chat, or returns the already-active one - shared by both
         the typed-message path and the ring-click voice path so a
         conversation is only ever created once, however it started.
-        Tags the new conversation to the active project, if any."""
+        Tags the new conversation to the active project (if any) and
+        the active agent, so it shows up in the right agent's sidebar."""
         if self.current_conversation_id is None:
             self.current_conversation_id = core.create_conversation(
-                first_message, project_id=self.current_project_id
+                first_message, project_id=self.current_project_id, agent=self.current_agent
             )
         return self.current_conversation_id
 
-    def send_message(self, text: str, agent: str = "main") -> str:
+    def _system_prompt_for_agent(self, agent: str) -> str:
+        """Single source of truth for which system prompt seeds a fresh
+        history for a given agent."""
+        if agent == "coding":
+            return core.CODING_AGENT_SYSTEM_PROMPT
+        return core.SYSTEM_PROMPT
+
+    def switch_agent(self, agent: str):
+        """
+        Persistent mode switch, triggered from the top-left agent
+        selector - replaces the old behavior where the dropdown only
+        affected a single in-flight message. Exits project mode (a
+        project always implies coding-with-file-access regardless of
+        the agent dropdown) and resets to a fresh, not-yet-created
+        conversation scoped to the new agent - mirrors new_chat(), just
+        also switching which agent that fresh chat belongs to.
+        """
+        self.current_agent = agent
+        self.history = [{"role": "system", "content": self._system_prompt_for_agent(agent)}]
+        self.current_conversation_id = None
+        self.current_project_id = None
+        self.current_project_path = None
+
+    def send_message(self, text: str) -> str:
         """
         Routing priority: an active project always wins (it implies
-        coding-with-file-access, regardless of the agent dropdown) -
-        otherwise agent selects "main" (full tool access) or "coding"
-        (stateless delegate to the coding specialist, no file access).
+        coding-with-file-access, regardless of the active agent) -
+        otherwise the persistently-selected agent (self.current_agent,
+        set via switch_agent) handles it. Coding now runs its own real
+        tool-calling loop with memory (run_coding_conversation), not a
+        one-shot delegate call - same shape as Main's run_conversation,
+        just a different model/system prompt.
         """
         conversation_id = self._ensure_conversation(text)
 
@@ -138,34 +168,33 @@ class Api:
                 text, self.history, conversation_id, self.current_project_path
             )
 
-        if agent == "coding":
-            reply = core.ask_coding_agent(text)
-            user_msg = {"role": "user", "content": text}
-            self.history.append(user_msg)
-            core.save_message(user_msg, conversation_id)
-            assistant_msg = {"role": "assistant", "content": reply}
-            self.history.append(assistant_msg)
-            core.save_message(assistant_msg, conversation_id)
-            return reply
+        if self.current_agent == "coding":
+            return core.run_coding_conversation(text, self.history, conversation_id)
 
         return core.run_conversation(text, self.history, conversation_id)
 
     def list_conversations(self) -> list:
-        return core.list_conversations()
+        """Scoped to the active agent - each agent's sidebar shows only
+        its own threads, per the Phase 3 spec."""
+        return core.list_conversations(agent=self.current_agent)
 
     def load_chat(self, conversation_id: int) -> list:
         """
         Reopens a past conversation from the sidebar: switches the active
-        thread, reloads full context for the model, and returns just the
-        user/assistant turns (skipping tool-call plumbing messages, which
-        were never shown in the log to begin with) for the UI to redraw.
-        Exits project mode - this is for regular standalone chats.
+        thread AND the active agent to whichever one owns this
+        conversation (so reopening a Coding thread also flips the
+        top-left switcher to Coding), reloads full context for the
+        model, and returns just the user/assistant turns (skipping
+        tool-call plumbing messages, which were never shown in the log
+        to begin with) for the UI to redraw. Exits project mode - this
+        is for regular standalone chats.
         """
+        self.current_agent = core.get_conversation_agent(conversation_id)
         self.current_project_id = None
         self.current_project_path = None
         self.current_conversation_id = conversation_id
         messages = core.load_conversation_messages(conversation_id)
-        self.history = [{"role": "system", "content": core.SYSTEM_PROMPT}] + messages
+        self.history = [{"role": "system", "content": self._system_prompt_for_agent(self.current_agent)}] + messages
 
         display = []
         for m in messages:
@@ -240,9 +269,10 @@ class Api:
 
     def new_chat(self):
         """Resets to a fresh, not-yet-created conversation - the next
-        message sent will start a genuinely new thread. Also exits
-        project mode, back to the regular main assistant."""
-        self.history = [{"role": "system", "content": core.SYSTEM_PROMPT}]
+        message sent will start a genuinely new thread - within the
+        SAME active agent (use switch_agent to actually change agents).
+        Also exits project mode, back to the regular current agent."""
+        self.history = [{"role": "system", "content": self._system_prompt_for_agent(self.current_agent)}]
         self.current_conversation_id = None
         self.current_project_id = None
         self.current_project_path = None
@@ -321,33 +351,37 @@ def _run_js(script: str):
 def _voice_turn():
     """
     The full ring-click interaction: show the window if it was hidden,
-    listen for a command right away (no greeting - a click is already an
-    explicit "listen now" signal), transcribe it, get ORACLE's reply -
-    speaking it out loud - while pushing both sides of the exchange into
-    the visible chat log.
+    then run one streaming Gemini Live exchange - listening, thinking
+    (including any tool calls), and speaking all happen inside that one
+    call now, rather than as three separate local-STT / cloud-LLM /
+    local-TTS steps. Both sides of the exchange still land in the
+    visible chat log and the same SQLite conversation as before.
     """
     if _window:
         _window.show()
 
     _run_js("setRingStatus('LISTENING...'); setRingThinking(true);")
 
-    text = core.listen_and_transcribe()
+    def ensure_conversation(user_text: str) -> int:
+        conv_id = _api._ensure_conversation(user_text)
+        _run_js(f"addMessage('user', {json.dumps(user_text)});")
+        return conv_id
 
-    if not text or text.startswith("Error"):
-        print(f"Voice turn ended without a usable command: {text}")
+    def on_status(status: str):
+        _run_js(f"setRingStatus('{status}');")
+
+    user_text, reply_text = gemini_voice.voice_turn_live(
+        _api.history, ensure_conversation, on_status=on_status
+    )
+
+    if not user_text:
+        print("Voice turn ended without a usable command.")
         _run_js("setRingThinking(false); setRingStatus('');")
         return
 
-    _run_js(f"addMessage('user', {json.dumps(text)});")
-    _run_js("setRingStatus('THINKING...');")
-
-    conversation_id = _api._ensure_conversation(text)
-    reply = core.run_conversation(text, _api.history, conversation_id)
     _run_js("if (typeof refreshChatList === 'function') refreshChatList();")
-
-    _run_js(f"addMessage('jarvis', {json.dumps(reply)});")
-    _run_js("setRingStatus('SPEAKING...');")
-    core.speak(reply)
+    if reply_text:
+        _run_js(f"addMessage('jarvis', {json.dumps(reply_text)});")
 
     _run_js("setRingThinking(false); setRingStatus('');")
 
@@ -419,9 +453,13 @@ if __name__ == "__main__":
         width=1200,
         height=780,
         min_size=(760, 520),
-        frameless=True,   # no OS title bar/borders - custom "-" button instead
-        easy_drag=True,   # not fullscreen anymore, so this is draggable
+        frameless=True,     # no OS title bar/borders - custom "-" button instead
+        easy_drag=False,    # whole-window drag was the bug - drag now comes from
+                             # the .pywebview-drag-region class in index.html instead,
+                             # scoped to just the topbar/sidebar-top strips
+        text_select=True,   # was blocking text selection/copy app-wide
         resizable=True,
+        shadow=True,        # subtle drop shadow - Windows only, floating-HUD feel
     )
     _window.events.closing += on_closing
 

@@ -10,11 +10,17 @@ Pillow
 faster-whisper
 sounddevice
 numpy
-piper-tts
 msal
 requests
 google-auth
 google-auth-oauthlib
+google-genai   # Gemini Live API - ring-click voice turns (gemini_voice.py)
+
+# piper-tts removed: was only used by core.speak(), which the ring-click
+# flow no longer calls (see gemini_voice.py). faster-whisper/sounddevice
+# stay - still used by core.listen_and_transcribe() for the mic-dictate
+# button in the chat textbox (start_recording/stop_recording), which is
+# a separate, untouched feature from the ring-click voice turn.
 
 # Only needed to build the standalone .exe (via build.bat) - not required
 # to just run `python ui.py` during development.
