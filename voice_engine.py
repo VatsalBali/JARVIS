@@ -329,6 +329,7 @@ class Player:
         self._playing = False
         self._ended = False       # no more audio coming this turn: play the tail
         self.level = 0.0
+        self.underflows = 0
         self._prebuffer = int(OUTPUT_RATE * PREBUFFER_SEC) * 2
         self._stream = sd.OutputStream(
             samplerate=OUTPUT_RATE, channels=1, dtype="int16",
@@ -337,6 +338,8 @@ class Player:
         self._stream.start()
 
     def _callback(self, outdata, frames, time_info, status):
+        if status.output_underflow:
+            self.underflows += 1  # the driver starved: audible as a crackle
         need = frames * 2
         starting = False
         with self._lock:
@@ -690,6 +693,8 @@ class Conversation:
         finally:
             self._finish_turn(final=True)
             self.engine.mic.unsubscribe(self.mic_q)
+            if self.player.underflows:
+                print(f"Audio output underflowed {self.player.underflows} times this conversation (heard as crackle).")
             self.player.close()
             self.engine.ducker.restore()
 
