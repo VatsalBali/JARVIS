@@ -2975,8 +2975,10 @@ def set_confirm_handler(handler):
 
 
 # What an unrecognised voice may use without the owner's approval
-# (README 4.3, voice identification): time, weather, general questions.
-GUEST_SAFE_TOOLS = {"get_current_time", "web_search", "get_system_info"}
+# (README 4.3, voice identification): time, weather, general questions,
+# plus opening an app or a web search - nothing that reads or sends
+# personal data, deletes, or runs commands.
+GUEST_SAFE_TOOLS = {"get_current_time", "web_search", "get_system_info", "launch_app", "open_web_search"}
 
 
 def execute_tool(fn_map: dict, fn_name: str, raw_args, speaker_verified=None) -> str:

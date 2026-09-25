@@ -19,8 +19,10 @@ const readline = require('readline');
 const ORB_W = 460;
 const ORB_H = 540;
 const HIDE_WHEN_ASLEEP = process.env.ORACLE_ORB_ASLEEP !== 'ember';
-// Ctrl+Space is VS Code's suggest shortcut, so the talk hotkey adds Alt.
-const TALK_HOTKEY = 'Control+Alt+Space';
+// Ctrl+Space is VS Code's suggest shortcut, so the talk hotkeys add Alt.
+// Ctrl+Alt+O is also the Start-menu shortcut's hotkey (install_shortcut.ps1):
+// it starts ORACLE when it isn't running, and talks when it is.
+const TALK_HOTKEYS = ['Control+Alt+O', 'Control+Alt+Space'];
 const MUTE_HOTKEY = 'Control+Alt+M';
 
 let backend = null;
@@ -30,8 +32,35 @@ let tray = null;
 let quitting = false;
 let muted = false;
 
+// A second launch (e.g. the Ctrl+Alt+O shortcut while running) just talks.
 if (!app.requestSingleInstanceLock()) {
-  app.quit();
+  app.exit(0);
+}
+app.on('second-instance', () => sendToBackend({ type: 'talk' }));
+
+// The orb sits behind every other window (the owner's choice). Electron has
+// no "send to back", so this calls SetWindowPos(HWND_BOTTOM) via koffi.
+const HWND_BOTTOM = 1;
+const HWND_NOTOPMOST = -2;
+const SWP_NOSIZE = 0x0001, SWP_NOMOVE = 0x0002, SWP_NOACTIVATE = 0x0010;
+let setWindowPos = null;
+try {
+  const user32 = require('koffi').load('user32.dll');
+  setWindowPos = user32.func('bool __stdcall SetWindowPos(intptr_t hWnd, intptr_t after, int X, int Y, int cx, int cy, uint32_t flags)');
+} catch (e) {
+  console.error('koffi unavailable; the orb can\'t be sent behind other windows:', e.message);
+}
+
+function orbHwnd() {
+  const handle = orb.getNativeWindowHandle();
+  return handle.length >= 8 ? handle.readBigInt64LE(0) : BigInt(handle.readInt32LE(0));
+}
+
+function sendOrbToBack() {
+  if (!orb || orb.isDestroyed() || !setWindowPos) return;
+  orb.setAlwaysOnTop(false);
+  setWindowPos(orbHwnd(), HWND_NOTOPMOST, 0, 0, 0, 0, SWP_NOSIZE | SWP_NOMOVE | SWP_NOACTIVATE);
+  setWindowPos(orbHwnd(), HWND_BOTTOM, 0, 0, 0, 0, SWP_NOSIZE | SWP_NOMOVE | SWP_NOACTIVATE);
 }
 
 function startBackend() {
@@ -84,7 +113,7 @@ function createOrb() {
     movable: false,
     minimizable: false,
     maximizable: false,
-    alwaysOnTop: true,
+    alwaysOnTop: false, // sits behind other windows; see sendOrbToBack
     skipTaskbar: true,
     focusable: false, // never steals focus from what you're doing
     hasShadow: false,
@@ -96,7 +125,6 @@ function createOrb() {
       backgroundThrottling: false, // keep the socket responsive while hidden
     },
   });
-  orb.setAlwaysOnTop(true, 'screen-saver');
   // Click-through everywhere except where the renderer says (Yes/No buttons).
   orb.setIgnoreMouseEvents(true, { forward: true });
   orb.webContents.on('console-message', (event) => console.log('[orb]', event.message));
@@ -131,7 +159,7 @@ function refreshTray() {
   tray.setImage(trayIcon());
   tray.setToolTip(muted ? 'ORACLE - microphone muted' : 'ORACLE - listening for you');
   tray.setContextMenu(Menu.buildFromTemplate([
-    { label: 'Talk to ORACLE', accelerator: TALK_HOTKEY, enabled: !muted, click: () => sendToBackend({ type: 'talk' }) },
+    { label: 'Talk to ORACLE', accelerator: TALK_HOTKEYS[0], enabled: !muted, click: () => sendToBackend({ type: 'talk' }) },
     { label: 'Mute microphone', type: 'checkbox', checked: muted, accelerator: MUTE_HOTKEY, click: () => sendToBackend({ type: 'mute', value: !muted }) },
     { label: 'Learn my voice…', enabled: !muted, click: () => sendToBackend({ type: 'enroll' }) },
     { type: 'separator' },
@@ -143,8 +171,26 @@ ipcMain.handle('backend-info', () => ({ ...backendInfo, hideWhenAsleep: HIDE_WHE
 
 ipcMain.on('orb-visible', (_e, visible) => {
   if (!orb || orb.isDestroyed()) return;
-  if (visible && !orb.isVisible()) orb.showInactive();
-  else if (!visible && orb.isVisible()) orb.hide();
+  if (visible && !orb.isVisible()) {
+    orb.showInactive();
+    if (!confirmPending) sendOrbToBack();
+  } else if (!visible && orb.isVisible()) {
+    orb.hide();
+  }
+});
+
+// Exception to "behind everything": a pending Yes/No comes to the front,
+// or it would time out unseen (and count as No).
+let confirmPending = false;
+ipcMain.on('orb-front', (_e, front) => {
+  if (!orb || orb.isDestroyed()) return;
+  confirmPending = !!front;
+  if (confirmPending) {
+    orb.setAlwaysOnTop(true, 'screen-saver');
+    if (!orb.isVisible()) orb.showInactive();
+  } else {
+    sendOrbToBack();
+  }
 });
 
 ipcMain.on('orb-mouse', (_e, interactive) => {
@@ -172,7 +218,9 @@ app.whenReady().then(async () => {
   tray.on('click', () => sendToBackend({ type: 'talk' }));
   refreshTray();
 
-  globalShortcut.register(TALK_HOTKEY, () => sendToBackend({ type: 'talk' }));
+  // If Windows already owns Ctrl+Alt+O for the Start-menu shortcut, this
+  // registration fails and the second-instance handler covers it instead.
+  for (const key of TALK_HOTKEYS) globalShortcut.register(key, () => sendToBackend({ type: 'talk' }));
   globalShortcut.register(MUTE_HOTKEY, () => sendToBackend({ type: 'mute', value: !muted }));
 });
 

@@ -276,10 +276,30 @@ class VoiceID:
         score = self.similarity(pcm)
         return (score is not None and score >= self.threshold), score
 
+    def log(self, score, ok: bool, seconds: float):
+        """Every check's score, for tuning voice_id_threshold."""
+        try:
+            path = os.path.join(_data_dir(), "voice_id_log.csv")
+            new = not os.path.exists(path)
+            with open(path, "a", newline="", encoding="utf-8") as f:
+                w = csv.writer(f)
+                if new:
+                    w.writerow(["time", "score", "verified", "speech_seconds", "threshold"])
+                w.writerow([
+                    datetime.now().isoformat(timespec="seconds"),
+                    "" if score is None else f"{score:.3f}", ok, f"{seconds:.1f}", self.threshold,
+                ])
+        except OSError:
+            pass
+
     def enroll(self, pcm: np.ndarray):
         emb = self._embed(pcm)
         np.save(self.path, emb)
         self.print = emb
+
+
+def _frames(pcm: np.ndarray) -> list:
+    return [pcm[i:i + FRAME] for i in range(0, pcm.size - FRAME + 1, FRAME)]
 
 
 def _voiced(frame: np.ndarray, floor: float) -> bool:
@@ -291,36 +311,72 @@ def _voiced(frame: np.ndarray, floor: float) -> bool:
 # Audio out + ducking
 # ---------------------------------------------------------------------------
 
+PREBUFFER_SEC = 0.2   # jitter buffer before (re)starting playback
+FADE_SAMPLES = 120    # 5 ms fades where playback starts/stops, so no clicks
+
+
 class Player:
-    """Callback-driven output so a barge-in can drop queued audio at once."""
+    """Callback-driven output so a barge-in can drop queued audio at once.
+
+    Gemini's audio arrives in bursts. Playing it the moment it lands means
+    brief underruns mid-sentence, heard as crackle/static, so playback waits
+    for a small buffer, and fades in/out wherever audio starts or runs dry.
+    """
 
     def __init__(self):
         self._buf = bytearray()
         self._lock = threading.Lock()
+        self._playing = False
+        self._ended = False       # no more audio coming this turn: play the tail
         self.level = 0.0
+        self._prebuffer = int(OUTPUT_RATE * PREBUFFER_SEC) * 2
         self._stream = sd.OutputStream(
-            samplerate=OUTPUT_RATE, channels=1, dtype="int16", callback=self._callback
+            samplerate=OUTPUT_RATE, channels=1, dtype="int16",
+            blocksize=int(OUTPUT_RATE * 0.05), latency="high", callback=self._callback,
         )
         self._stream.start()
 
     def _callback(self, outdata, frames, time_info, status):
         need = frames * 2
+        starting = False
         with self._lock:
-            chunk = bytes(self._buf[:need])
-            del self._buf[:need]
-        samples = np.frombuffer(chunk, dtype=np.int16)
-        self.level = _level(samples) if samples.size else 0.0
+            if not self._playing and self._buf and (len(self._buf) >= self._prebuffer or self._ended):
+                self._playing = starting = True
+            if self._playing:
+                n = min(need, len(self._buf) - len(self._buf) % 2)
+                chunk = bytes(self._buf[:n])
+                del self._buf[:n]
+            else:
+                chunk = b""
+        samples = np.frombuffer(chunk, dtype=np.int16).astype(np.float32)
+        if samples.size:
+            f = min(FADE_SAMPLES, samples.size)
+            if starting:
+                samples[:f] *= np.linspace(0.0, 1.0, f)
+            if samples.size < frames:
+                samples[-f:] *= np.linspace(1.0, 0.0, f)  # ran dry: fade, then rebuffer
+                with self._lock:
+                    self._playing = False
+        self.level = _level(samples.astype(np.int16)) if samples.size else 0.0
         out = np.zeros(frames, dtype=np.int16)
-        out[: samples.size] = samples
+        out[: samples.size] = samples.astype(np.int16)
         outdata[:, 0] = out
 
     def write(self, data: bytes):
         with self._lock:
             self._buf.extend(data)
+            self._ended = False
+
+    def end_turn(self):
+        """The model finished this reply: play whatever is left without waiting
+        for the jitter buffer to fill."""
+        with self._lock:
+            self._ended = True
 
     def flush(self):
         with self._lock:
             self._buf.clear()
+            self._playing = False
 
     @property
     def busy(self) -> bool:
@@ -391,7 +447,8 @@ class Conversation:
         self.last_transcript_at = 0.0
         self.user_parts = []
         self.reply_parts = []
-        self.turn_audio = []          # this turn's user audio, for voice ID
+        self.turn_audio = []          # this turn's user audio
+        self.voiced_audio = deque(maxlen=12 * FRAMES_PER_SEC)  # speech only, for voice ID
         self._verified = None         # cached per turn
         self.player = None
 
@@ -435,12 +492,16 @@ class Conversation:
         self._set_mode("listening")
 
     def speaker_verified(self) -> bool:
-        """Called on the tool thread. Wake word + this turn's speech vs. the
-        owner's voiceprint; computed once per turn."""
+        """Called on the tool thread; computed once per turn. Compares only
+        speech frames (as enrolment does) - silence and room noise in the
+        sample drag the similarity down - from the wake word plus everything
+        said in this conversation, so short follow-ups have enough audio."""
         if self._verified is None:
-            parts = ([self.wake_audio] if self.wake_audio.size else []) + list(self.turn_audio)
+            wake = [f for f in _frames(self.wake_audio) if _voiced(f, LOCAL_VAD_FLOOR)]
+            parts = wake + list(self.voiced_audio)
             pcm = np.concatenate(parts) if parts else np.zeros(0, dtype=np.int16)
             ok, score = self.engine.voice_id.verify(pcm)
+            self.engine.voice_id.log(score, ok, pcm.size / RATE)
             self._verified = ok
             self.emit({
                 "type": "speaker", "verified": ok, "enrolled": self.engine.voice_id.enrolled,
@@ -478,6 +539,7 @@ class Conversation:
                 # Local speech detection: Gemini's transcript only arrives
                 # once the owner stops talking, too late for the timeouts.
                 if _voiced(frame, LOCAL_VAD_FLOOR):
+                    self.voiced_audio.append(frame)
                     self.last_voice_at = time.monotonic()
                     if self.mode == "listening":
                         self.heard_speech = True
@@ -568,6 +630,8 @@ class Conversation:
                         self.reply_parts.append(sc.output_transcription.text)
                         if not self.drop_audio:
                             self.emit({"type": "caption", "text": "".join(self.reply_parts).strip()})
+                    if sc.generation_complete or sc.turn_complete:
+                        self.player.end_turn()
                     if sc.turn_complete:
                         self.drop_audio = False
                         if self.barged:
@@ -590,6 +654,20 @@ class Conversation:
             if not got_any:
                 self._end()  # connection closed
 
+    async def _guard(self, coro):
+        """A crashed task ends the conversation (and says why) instead of
+        leaving it half-alive until a timeout."""
+        try:
+            await coro
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            print(f"Voice conversation task failed: {e}")
+            self.emit({"type": "caption", "text": "Something went wrong on my end."})
+            self._end()
+
     async def run(self):
         self.loop = asyncio.get_running_loop()
         self.done = asyncio.Event()
@@ -601,9 +679,9 @@ class Conversation:
             async with contextlib.AsyncExitStack() as stack:
                 session = await gemini_voice.connect_live(stack, config)
                 tasks = [
-                    asyncio.create_task(self._send_loop(session)),
-                    asyncio.create_task(self._receive_loop(session)),
-                    asyncio.create_task(self._watchdog()),
+                    asyncio.create_task(self._guard(self._send_loop(session))),
+                    asyncio.create_task(self._guard(self._receive_loop(session))),
+                    asyncio.create_task(self._guard(self._watchdog())),
                 ]
                 await self.done.wait()
                 for t in tasks:

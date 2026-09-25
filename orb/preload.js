@@ -5,6 +5,7 @@ contextBridge.exposeInMainWorld('oracle', {
   backendInfo: () => ipcRenderer.invoke('backend-info'),
   setVisible: (visible) => ipcRenderer.send('orb-visible', !!visible),
   setInteractive: (interactive) => ipcRenderer.send('orb-mouse', !!interactive),
+  setFront: (front) => ipcRenderer.send('orb-front', !!front),
   reportMuted: (value) => ipcRenderer.send('orb-muted', !!value),
   // Messages from the tray/hotkeys to forward to the backend socket.
   onCommand: (callback) => ipcRenderer.on('command', (_e, msg) => callback(msg)),

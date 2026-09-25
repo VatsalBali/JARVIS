@@ -38,6 +38,7 @@
   let state = null; // set by the first setState
   let hideWhenAsleep = true;
   let pendingConfirm = null;
+  let greeted = false;
   let hideTimer = null;
 
   function setText(text) {
@@ -89,6 +90,7 @@
     confirmHint.textContent = msg.spoken ? 'Say “yes” or “no”, or click.' : '';
     confirmEl.hidden = false;
     captionsEl.classList.add('confirming');
+    if (bridge) bridge.setFront(true);
     show();
   }
 
@@ -97,7 +99,10 @@
     pendingConfirm = null;
     confirmEl.hidden = true;
     captionsEl.classList.remove('confirming');
-    if (bridge) bridge.setInteractive(false);
+    if (bridge) {
+      bridge.setInteractive(false);
+      bridge.setFront(false);
+    }
     if (state === 'asleep') hideSoon();
   }
 
@@ -126,6 +131,16 @@
         if (msg.wake_phrase) DEFAULT_TEXT.asleep = `Say “${msg.wake_phrase}”`;
         setState(msg.state || 'asleep');
         bridge.reportMuted(!!msg.muted);
+        if (!greeted && state === 'asleep') {
+          // First connection after launch: show the orb briefly so starting
+          // ORACLE (e.g. with Ctrl+Alt+O) visibly did something.
+          greeted = true;
+          labelEl.textContent = 'ONLINE';
+          setText(DEFAULT_TEXT.asleep);
+          lens.setState('wake');
+          show();
+          setTimeout(() => { if (state === 'asleep') setState('asleep'); }, 2500);
+        }
         break;
       case 'state':
         setState(msg.state, msg.label);
