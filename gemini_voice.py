@@ -107,6 +107,23 @@ def _to_gemini_tools() -> list:
     return declarations
 
 
+_B64_CHARS = frozenset(b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=\r\n")
+
+
+def pcm_bytes(data: bytes) -> bytes:
+    """Audio from the Live API should arrive decoded. With pydantic older
+    than google-genai needs (<2.12), it arrives still base64-encoded, and
+    playing that text as PCM sounds like pure static. Real PCM is almost
+    never made only of base64 characters, so decode when it is."""
+    if len(data) >= 16 and len(data) % 4 == 0 and _B64_CHARS.issuperset(data):
+        import base64
+        try:
+            return base64.b64decode(data, validate=False)
+        except ValueError:
+            pass
+    return data
+
+
 def system_instruction(text: str) -> types.Content:
     """Typed rather than a plain {"parts": [...]} dict: with older pydantic
     versions the dict gets validated as a Part and the connect fails."""
@@ -199,7 +216,7 @@ async def _run_turn(on_status=None, on_event=None) -> tuple:
                     if on_status:
                         on_status("SPEAKING...")
                     set_state("speaking")
-                    audio = np.frombuffer(response.data, dtype=np.int16)
+                    audio = np.frombuffer(pcm_bytes(response.data), dtype=np.int16)
                     emit({"type": "level", "value": _level(audio)})
                     await asyncio.to_thread(out_stream.write, audio)
 

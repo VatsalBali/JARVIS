@@ -15,6 +15,7 @@ requests
 google-auth
 google-auth-oauthlib
 google-genai   # Gemini Live API - ring-click voice turns (gemini_voice.py)
+pydantic>=2.12.5   # older pydantic leaves Live audio base64-encoded: replies play as static
 
 # Orb backend + voice engine (oracle_server.py, voice_engine.py)
 websockets

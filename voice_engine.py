@@ -330,6 +330,7 @@ class Player:
         self._ended = False       # no more audio coming this turn: play the tail
         self.level = 0.0
         self.underflows = 0
+        self.tap = [] if os.environ.get("ORACLE_AUDIO_TAP") else None  # debug: keep what was played
         self._prebuffer = int(OUTPUT_RATE * PREBUFFER_SEC) * 2
         self._stream = sd.OutputStream(
             samplerate=OUTPUT_RATE, channels=1, dtype="int16",
@@ -364,6 +365,8 @@ class Player:
         out = np.zeros(frames, dtype=np.int16)
         out[: samples.size] = samples.astype(np.int16)
         outdata[:, 0] = out
+        if self.tap is not None and samples.size:
+            self.tap.append(out[: samples.size].copy())
 
     def write(self, data: bytes):
         with self._lock:
@@ -389,6 +392,18 @@ class Player:
     def close(self):
         self._stream.stop()
         self._stream.close()
+        if self.tap:
+            # ORACLE_AUDIO_TAP=<folder>: save exactly what reached the speakers.
+            import wave
+            folder = os.environ["ORACLE_AUDIO_TAP"]
+            os.makedirs(folder, exist_ok=True)
+            path = os.path.join(folder, datetime.now().strftime("played_%H%M%S.wav"))
+            with wave.open(path, "wb") as w:
+                w.setnchannels(1)
+                w.setsampwidth(2)
+                w.setframerate(OUTPUT_RATE)
+                w.writeframes(np.concatenate(self.tap).tobytes())
+            print(f"Saved played audio to {path}")
 
 
 class Ducker:
@@ -596,7 +611,7 @@ class Conversation:
                         self.sending = False  # no mic to Gemini while it talks (no echo cancel)
                         self._set_mode("speaking")
                         self.engine.ducker.duck()
-                    self.player.write(response.data)
+                    self.player.write(gemini_voice.pcm_bytes(response.data))
 
                 elif response.tool_call:
                     self.sending = False
