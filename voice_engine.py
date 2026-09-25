@@ -50,6 +50,11 @@ WAKE_COOLDOWN_SEC = 2.0
 NO_SPEECH_SEC = 8.0               # give up if nothing is said after a wake
 NO_REPLY_SEC = 15.0               # give up if Gemini doesn't answer after speech stops
 LOCAL_VAD_FLOOR = 0.004           # speech if frame RMS > max(0.01, 3x this)
+GATE_HANGOVER_SEC = 0.6           # after speech stops, send silence instead of room noise
+SPEECH_PROB = 0.5                 # Silero VAD speech probability threshold
+SPEECH_RMS_FLOOR = 0.006          # ...and at least this loud (drops very distant voices)
+FOLLOWUP_MAX_SEC = 15.0           # speech can stretch the follow-up window, but no further
+LISTEN_MAX_SEC = 45.0             # one request can't hold the mic open longer than this
 FOLLOWUP_SEC = 6.0                # README 4.1: keep listening ~6 s after a reply
 STOP_DEBOUNCE_SEC = 0.7
 DUCK_LEVEL = 0.3                  # other apps' volume while ORACLE talks
@@ -302,6 +307,28 @@ def _frames(pcm: np.ndarray) -> list:
     return [pcm[i:i + FRAME] for i in range(0, pcm.size - FRAME + 1, FRAME)]
 
 
+class SpeechDetector:
+    """Is this 80 ms frame someone speaking? Silero VAD (shipped with
+    openWakeWord) plus a loudness floor. Loudness alone counts keyboard
+    clicks as speech (~20% of click frames in tests; Silero: 0%), which
+    kept the follow-up window open indefinitely. Stateful: one per stream."""
+
+    def __init__(self):
+        try:
+            from openwakeword.vad import VAD
+            self._vad = VAD()
+        except Exception as e:
+            print(f"Silero VAD unavailable, using loudness only: {e}")
+            self._vad = None
+
+    def __call__(self, frame: np.ndarray) -> bool:
+        rms = float(np.sqrt(np.mean((frame.astype(np.float32) / 32768.0) ** 2)))
+        if self._vad is None:
+            return rms > max(0.01, LOCAL_VAD_FLOOR * 3.0)
+        prob = self._vad.predict(frame, frame_size=640)  # also advances its state
+        return prob > SPEECH_PROB and rms > SPEECH_RMS_FLOOR
+
+
 def _voiced(frame: np.ndarray, floor: float) -> bool:
     rms = float(np.sqrt(np.mean((frame.astype(np.float32) / 32768.0) ** 2)))
     return rms > max(0.01, floor * 3.0)
@@ -330,6 +357,8 @@ class Player:
         self._ended = False       # no more audio coming this turn: play the tail
         self.level = 0.0
         self.underflows = 0
+        self.rebuffers = 0
+        self.played_samples = 0
         self.tap = [] if os.environ.get("ORACLE_AUDIO_TAP") else None  # debug: keep what was played
         self._prebuffer = int(OUTPUT_RATE * PREBUFFER_SEC) * 2
         self._stream = sd.OutputStream(
@@ -361,6 +390,9 @@ class Player:
                 samples[-f:] *= np.linspace(1.0, 0.0, f)  # ran dry: fade, then rebuffer
                 with self._lock:
                     self._playing = False
+                    if not self._ended:
+                        self.rebuffers += 1  # a gap mid-reply
+            self.played_samples += samples.size
         self.level = _level(samples.astype(np.int16)) if samples.size else 0.0
         out = np.zeros(frames, dtype=np.int16)
         out[: samples.size] = samples.astype(np.int16)
@@ -466,13 +498,19 @@ class Conversation:
         self.last_server_at = self.listen_started
         self.tool_running = False
         self.followup_until = 0.0
+        self.followup_started = 0.0
         self.last_transcript_at = 0.0
+        self.is_speech = SpeechDetector()
         self.user_parts = []
         self.reply_parts = []
         self.turn_audio = []          # this turn's user audio
         self.voiced_audio = deque(maxlen=12 * FRAMES_PER_SEC)  # speech only, for voice ID
         self._verified = None         # cached per turn
         self.player = None
+        # Diagnostics, written to voice_sessions.log when the conversation ends.
+        self.t0 = time.monotonic()
+        self.stats = {"audio_bytes": 0, "gated_frames": 0}
+        self.events = []
 
     # ---- called from other threads ----
 
@@ -490,9 +528,36 @@ class Conversation:
 
     # ---- helpers (loop thread unless noted) ----
 
+    def _event(self, name: str):
+        self.events.append((round(time.monotonic() - self.t0, 2), name))
+
     def _set_mode(self, mode: str, state: str = None):
+        if mode != self.mode or not self.events:
+            self._event(mode)
         self.mode = mode
         self.emit({"type": "state", "state": state or mode})
+
+    def _write_log(self):
+        """One JSON line per conversation, for diagnosing how replies sounded."""
+        import json
+        p = self.player
+        record = {
+            "time": datetime.now().isoformat(timespec="seconds"),
+            "model": gemini_voice._working_model,
+            "trusted": self.trusted,
+            "seconds": round(time.monotonic() - self.t0, 1),
+            "audio_received_s": round(self.stats["audio_bytes"] / (OUTPUT_RATE * 2), 2),
+            "audio_played_s": round(p.played_samples / OUTPUT_RATE, 2) if p else 0,
+            "rebuffers": p.rebuffers if p else 0,
+            "underflows": p.underflows if p else 0,
+            "gated_s": round(self.stats["gated_frames"] / FRAMES_PER_SEC, 1),
+            "events": self.events,
+        }
+        try:
+            with open(os.path.join(_data_dir(), "voice_sessions.log"), "a", encoding="utf-8") as f:
+                f.write(json.dumps(record) + "\n")
+        except OSError:
+            pass
 
     def _end(self):
         if self.done and not self.done.is_set():
@@ -501,6 +566,7 @@ class Conversation:
     def _barge_in(self):
         if self.mode not in ("thinking", "speaking", "draining"):
             return
+        self._event("barge_in")
         self.player.flush()
         # Only a turn still in progress will send a turn_complete to skip.
         self.barged = self.mode in ("speaking", "thinking")
@@ -521,7 +587,8 @@ class Conversation:
         if self.trusted:
             return True
         if self._verified is None:
-            wake = [f for f in _frames(self.wake_audio) if _voiced(f, LOCAL_VAD_FLOOR)]
+            detect = SpeechDetector()
+            wake = [f for f in _frames(self.wake_audio) if detect(f)]
             parts = wake + list(self.voiced_audio)
             pcm = np.concatenate(parts) if parts else np.zeros(0, dtype=np.int16)
             ok, score = self.engine.voice_id.verify(pcm)
@@ -558,20 +625,33 @@ class Conversation:
                 frame = await asyncio.to_thread(self.mic_q.get, True, 0.2)
             except queue.Empty:
                 continue
+            voiced = self.is_speech(frame)
             if self.mode in ("listening", "followup"):
                 self.turn_audio.append(frame)
                 # Local speech detection: Gemini's transcript only arrives
                 # once the owner stops talking, too late for the timeouts.
-                if _voiced(frame, LOCAL_VAD_FLOOR):
+                if voiced:
                     self.voiced_audio.append(frame)
                     self.last_voice_at = time.monotonic()
                     if self.mode == "listening":
                         self.heard_speech = True
                     else:
-                        self.followup_until = max(self.followup_until, self.last_voice_at + 2.0)
+                        self.followup_until = min(
+                            max(self.followup_until, self.last_voice_at + 2.0),
+                            self.followup_started + FOLLOWUP_MAX_SEC,
+                        )
                 if self.mode == "listening":
                     self.emit({"type": "level", "value": _level(frame)})
             if self.sending:
+                # Noise gate: once the owner has spoken and gone quiet, send
+                # true silence until they speak again. Otherwise a keyboard
+                # click or breath while Gemini prepares its answer counts as
+                # the owner interrupting, and it abandons the reply midway.
+                gated = (self.heard_speech and not voiced
+                         and time.monotonic() - self.last_voice_at > GATE_HANGOVER_SEC)
+                if gated:
+                    frame = np.zeros_like(frame)
+                    self.stats["gated_frames"] += 1
                 await session.send_realtime_input(
                     audio=types.Blob(data=frame.tobytes(), mime_type=f"audio/pcm;rate={RATE}")
                 )
@@ -586,6 +666,9 @@ class Conversation:
                 self._end()
             elif self.mode == "listening" and self.heard_speech and now - self.last_voice_at > NO_REPLY_SEC:
                 self._end()  # spoke, then silence, and Gemini never answered
+            elif self.mode == "listening" and now - self.listen_started > LISTEN_MAX_SEC:
+                self._event("listen_cap")
+                self._end()  # constant background speech (TV, room) keeps "hearing" someone
             elif (self.mode == "thinking" and not self.tool_running
                     and now - self.last_server_at > NO_REPLY_SEC):
                 self._end()  # waiting on an answer that never came
@@ -595,6 +678,7 @@ class Conversation:
                 self.sending = True
                 self.turn_audio = []
                 self.heard_speech = False
+                self.followup_started = now
                 self.followup_until = now + FOLLOWUP_SEC
                 self._set_mode("followup")
                 self.engine.ducker.restore()
@@ -617,11 +701,16 @@ class Conversation:
                         self.sending = False  # no mic to Gemini while it talks (no echo cancel)
                         self._set_mode("speaking")
                         self.engine.ducker.duck()
-                    self.player.write(gemini_voice.pcm_bytes(response.data))
+                    pcm = gemini_voice.pcm_bytes(response.data)
+                    if not self.stats["audio_bytes"]:
+                        self._event("first_audio")
+                    self.stats["audio_bytes"] += len(pcm)
+                    self.player.write(pcm)
 
                 elif response.tool_call:
                     self.sending = False
                     self._set_mode("thinking")
+                    self._event("tool:" + ",".join(fc.name for fc in response.tool_call.function_calls))
                     responses = []
                     self.tool_running = True  # may wait minutes on a confirmation
                     try:
@@ -640,8 +729,12 @@ class Conversation:
                 if response.server_content:
                     sc = response.server_content
                     if sc.interrupted:
+                        # Gemini abandoned this reply (it heard the owner, or
+                        # noise). Drop its audio and its text: it won't be said.
                         self.player.flush()
                         self.drop_audio = False
+                        self.reply_parts = []
+                        self._event("interrupted_by_server")
                     if sc.input_transcription and sc.input_transcription.text:
                         self.user_parts.append(sc.input_transcription.text)
                         self.last_transcript_at = time.monotonic()
@@ -657,6 +750,7 @@ class Conversation:
                     if sc.generation_complete or sc.turn_complete:
                         self.player.end_turn()
                     if sc.turn_complete:
+                        self._event("turn_complete")
                         self.drop_audio = False
                         if self.barged:
                             # The turn that ended is the one we cut off: save
@@ -676,6 +770,8 @@ class Conversation:
                             self.sending = False
                             self._set_mode("draining", state="speaking")
             if not got_any:
+                self._event("server_closed")
+                print("Gemini closed the voice session.")
                 self._end()  # connection closed
 
     async def _guard(self, coro):
@@ -714,9 +810,9 @@ class Conversation:
         finally:
             self._finish_turn(final=True)
             self.engine.mic.unsubscribe(self.mic_q)
-            if self.player.underflows:
-                print(f"Audio output underflowed {self.player.underflows} times this conversation (heard as crackle).")
+            self._event("end")
             self.player.close()
+            self._write_log()
             self.engine.ducker.restore()
 
 
