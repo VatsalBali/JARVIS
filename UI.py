@@ -41,6 +41,12 @@ _window = None
 _api = None
 _is_maximized = False
 
+# Confirm-tier tool calls (core.TOOL_TIERS) waiting on the owner's Yes/No.
+# request id -> {"event": threading.Event, "ok": bool}
+_pending_confirms = {}
+_pending_lock = threading.Lock()
+CONFIRM_TIMEOUT_SEC = 120  # no answer counts as No
+
 
 def resource_path(relative_path: str) -> str:
     """
@@ -313,6 +319,14 @@ class Api:
         """
         threading.Thread(target=_voice_turn, daemon=True).start()
 
+    def confirm_reply(self, request_id: str, ok: bool):
+        """Yes/No clicked on a confirmation card (see _ui_confirm)."""
+        with _pending_lock:
+            slot = _pending_confirms.get(request_id)
+        if slot:
+            slot["ok"] = bool(ok)
+            slot["event"].set()
+
     def hide_window(self):
         """Hides the window to the tray - the "x" (close) button."""
         if _window:
@@ -346,6 +360,30 @@ def _run_js(script: str):
             _window.evaluate_js(script)
         except Exception as e:
             print(f"evaluate_js failed: {e}")
+
+
+def _ui_confirm(request: dict) -> bool:
+    """
+    core's confirmation handler. Called on whichever thread is running the
+    tool call (a js_api thread for typed chat, the voice thread for ring
+    clicks), so it can block: it shows a Yes/No card in the window and
+    waits for Api.confirm_reply. Times out to No.
+    """
+    if not _window:
+        return False
+    slot = {"event": threading.Event(), "ok": False}
+    with _pending_lock:
+        _pending_confirms[request["id"]] = slot
+
+    _window.show()
+    _run_js(f"showConfirm({json.dumps(request)});")
+    answered = slot["event"].wait(CONFIRM_TIMEOUT_SEC)
+
+    with _pending_lock:
+        _pending_confirms.pop(request["id"], None)
+    if not answered:
+        _run_js(f"expireConfirm({json.dumps(request['id'])});")
+    return answered and slot["ok"]
 
 
 def _voice_turn():
@@ -462,6 +500,7 @@ if __name__ == "__main__":
         shadow=True,        # subtle drop shadow - Windows only, floating-HUD feel
     )
     _window.events.closing += on_closing
+    core.set_confirm_handler(_ui_confirm)
 
     tray_thread = threading.Thread(target=run_tray, daemon=True)
     tray_thread.start()

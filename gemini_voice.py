@@ -138,11 +138,11 @@ async def _run_turn(on_status=None) -> tuple:
 
                     function_responses = []
                     for fc in response.tool_call.function_calls:
-                        fn = core.AVAILABLE_FUNCTIONS.get(fc.name)
-                        try:
-                            result = fn(**fc.args) if fn else f"Unknown tool: {fc.name}"
-                        except Exception as e:
-                            result = f"Error: {e}"
+                        # Same dispatcher as the typed path, so risky
+                        # actions get the owner's confirmation here too.
+                        result = await asyncio.to_thread(
+                            core.execute_tool, core.AVAILABLE_FUNCTIONS, fc.name, dict(fc.args or {})
+                        )
                         function_responses.append(
                             types.FunctionResponse(
                                 id=fc.id, name=fc.name, response={"result": str(result)}
