@@ -130,10 +130,20 @@ def system_instruction(text: str) -> types.Content:
     return types.Content(parts=[types.Part(text=text)])
 
 
+def voice_settings() -> tuple:
+    """(voice name or None for Gemini's default, extra style instruction).
+    Set with core.set_setting("voice_name", "Charon") and
+    core.set_setting("voice_accent", "british"), or ORACLE_VOICE."""
+    name = os.environ.get("ORACLE_VOICE") or core.get_setting("voice_name") or None
+    accent = (core.get_setting("voice_accent") or "").strip().lower()
+    style = " Speak with a calm, refined British accent." if accent == "british" else ""
+    return name, style
+
+
 def _live_config(system_text: str = None) -> dict:
-    return {
+    voice, style = voice_settings()
+    config = {
         "response_modalities": ["AUDIO"],
-        "system_instruction": system_instruction(system_text or core.SYSTEM_PROMPT),
         "tools": [{"function_declarations": _to_gemini_tools()}],
         # Ask Gemini to also give us text transcripts of both sides of
         # the exchange - needed so we can save/display the turn in the
@@ -143,6 +153,10 @@ def _live_config(system_text: str = None) -> dict:
         "input_audio_transcription": {},
         "output_audio_transcription": {},
     }
+    if voice:
+        config["speech_config"] = types.SpeechConfig(voice_config=types.VoiceConfig(
+            prebuilt_voice_config=types.PrebuiltVoiceConfig(voice_name=voice)))
+    return config
 
 
 def _level(samples: np.ndarray) -> float:
