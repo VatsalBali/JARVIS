@@ -22,6 +22,7 @@ automatically, or set ORACLE_WAKE_MODEL to a model path or name.
 """
 
 import asyncio
+import contextlib
 import csv
 import os
 import queue
@@ -47,6 +48,8 @@ WAKE_THRESHOLD = 0.5              # per-frame score to count as a hit
 WAKE_PATIENCE = 2                 # consecutive hits needed (cuts false wakes)
 WAKE_COOLDOWN_SEC = 2.0
 NO_SPEECH_SEC = 8.0               # give up if nothing is said after a wake
+NO_REPLY_SEC = 15.0               # give up if Gemini doesn't answer after speech stops
+LOCAL_VAD_FLOOR = 0.004           # speech if frame RMS > max(0.01, 3x this)
 FOLLOWUP_SEC = 6.0                # README 4.1: keep listening ~6 s after a reply
 STOP_DEBOUNCE_SEC = 0.7
 DUCK_LEVEL = 0.3                  # other apps' volume while ORACLE talks
@@ -381,6 +384,9 @@ class Conversation:
         self.barged = False           # the in-progress turn was cut off by the owner
         self.heard_speech = False
         self.listen_started = time.monotonic()
+        self.last_voice_at = self.listen_started
+        self.last_server_at = self.listen_started
+        self.tool_running = False
         self.followup_until = 0.0
         self.last_transcript_at = 0.0
         self.user_parts = []
@@ -442,16 +448,22 @@ class Conversation:
             })
         return self._verified
 
-    def _finish_turn(self):
+    def _finish_turn(self, final: bool = False) -> bool:
+        """Saves the exchange once it has a reply. After a tool call Gemini
+        ends one turn silently and answers in the next, so a question with
+        no reply yet is held (unless the session is ending). Returns whether
+        a reply was saved."""
         user_text = "".join(self.user_parts).strip()
         reply_text = "".join(self.reply_parts).strip()
+        if user_text and not reply_text and not final:
+            return False
         self.user_parts, self.reply_parts = [], []
         self.turn_audio = []
         self._verified = None
         if user_text:
             self.emit({"type": "transcript", "text": user_text, "final": True})
             self.engine.save_turn(user_text, reply_text)
-        return user_text, reply_text
+        return bool(reply_text)
 
     # ---- tasks ----
 
@@ -463,6 +475,14 @@ class Conversation:
                 continue
             if self.mode in ("listening", "followup"):
                 self.turn_audio.append(frame)
+                # Local speech detection: Gemini's transcript only arrives
+                # once the owner stops talking, too late for the timeouts.
+                if _voiced(frame, LOCAL_VAD_FLOOR):
+                    self.last_voice_at = time.monotonic()
+                    if self.mode == "listening":
+                        self.heard_speech = True
+                    else:
+                        self.followup_until = max(self.followup_until, self.last_voice_at + 2.0)
                 if self.mode == "listening":
                     self.emit({"type": "level", "value": _level(frame)})
             if self.sending:
@@ -478,6 +498,11 @@ class Conversation:
                 self.emit({"type": "level", "value": self.player.level})
             if self.mode == "listening" and not self.heard_speech and now - self.listen_started > NO_SPEECH_SEC:
                 self._end()
+            elif self.mode == "listening" and self.heard_speech and now - self.last_voice_at > NO_REPLY_SEC:
+                self._end()  # spoke, then silence, and Gemini never answered
+            elif (self.mode == "thinking" and not self.tool_running
+                    and now - self.last_server_at > NO_REPLY_SEC):
+                self._end()  # waiting on an answer that never came
             elif self.mode == "draining" and not self.player.busy:
                 # Reply finished playing: listen for a follow-up without the
                 # wake word. Starting only now keeps ORACLE from hearing itself.
@@ -500,9 +525,8 @@ class Conversation:
             got_any = False
             async for response in session.receive():
                 got_any = True
-                if response.data is not None:
-                    if self.drop_audio:
-                        continue
+                self.last_server_at = time.monotonic()
+                if response.data is not None and not self.drop_audio:
                     if self.mode != "speaking":
                         self.sending = False  # no mic to Gemini while it talks (no echo cancel)
                         self._set_mode("speaking")
@@ -513,14 +537,21 @@ class Conversation:
                     self.sending = False
                     self._set_mode("thinking")
                     responses = []
-                    for fc in response.tool_call.function_calls:
-                        result = await asyncio.to_thread(
-                            core.execute_tool, fns, fc.name, dict(fc.args or {}), self.speaker_verified
-                        )
-                        responses.append(types.FunctionResponse(id=fc.id, name=fc.name, response={"result": str(result)}))
+                    self.tool_running = True  # may wait minutes on a confirmation
+                    try:
+                        for fc in response.tool_call.function_calls:
+                            result = await asyncio.to_thread(
+                                core.execute_tool, fns, fc.name, dict(fc.args or {}), self.speaker_verified
+                            )
+                            responses.append(types.FunctionResponse(id=fc.id, name=fc.name, response={"result": str(result)}))
+                    finally:
+                        self.tool_running = False
+                        self.last_server_at = time.monotonic()
                     await session.send_tool_response(function_responses=responses)
 
-                elif response.server_content:
+                # Not elif: newer Live models send transcripts in the same
+                # message as the audio chunk.
+                if response.server_content:
                     sc = response.server_content
                     if sc.interrupted:
                         self.player.flush()
@@ -539,11 +570,18 @@ class Conversation:
                             self.emit({"type": "caption", "text": "".join(self.reply_parts).strip()})
                     if sc.turn_complete:
                         self.drop_audio = False
-                        self._finish_turn()
                         if self.barged:
-                            # The turn that ended is the one we cut off; the
-                            # owner is already talking again, so keep listening.
+                            # The turn that ended is the one we cut off: save
+                            # it as it stands and keep listening, since the
+                            # owner is already talking again.
+                            self._finish_turn(final=True)
                             self.barged = False
+                            continue
+                        replied = self._finish_turn()
+                        if not replied and self.user_parts:
+                            # Silent turn after a tool call: the answer is
+                            # still coming, so don't open the follow-up yet.
+                            self._set_mode("thinking")
                         else:
                             # Let the reply finish playing, then the watchdog
                             # opens the follow-up window.
@@ -556,12 +594,12 @@ class Conversation:
         self.loop = asyncio.get_running_loop()
         self.done = asyncio.Event()
         self.player = Player()
-        config = gemini_voice._live_config()
-        config["system_instruction"] = {"parts": [{"text": core.SYSTEM_PROMPT + VOICE_STYLE}]}
+        config = gemini_voice._live_config(core.SYSTEM_PROMPT + VOICE_STYLE)
         self.engine.ducker.duck()
         self._set_mode("listening")
         try:
-            async with gemini_voice._client.aio.live.connect(model=gemini_voice.MODEL, config=config) as session:
+            async with contextlib.AsyncExitStack() as stack:
+                session = await gemini_voice.connect_live(stack, config)
                 tasks = [
                     asyncio.create_task(self._send_loop(session)),
                     asyncio.create_task(self._receive_loop(session)),
@@ -572,7 +610,7 @@ class Conversation:
                     t.cancel()
                 await asyncio.gather(*tasks, return_exceptions=True)
         finally:
-            self._finish_turn()
+            self._finish_turn(final=True)
             self.engine.mic.unsubscribe(self.mic_q)
             self.player.close()
             self.engine.ducker.restore()

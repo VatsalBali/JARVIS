@@ -36,6 +36,7 @@ live-capable model if this one starts erroring.
 """
 
 import asyncio
+import contextlib
 import os
 import numpy as np
 import sounddevice as sd
@@ -44,10 +45,42 @@ from google.genai import types
 
 import core  # reuse TOOLS, AVAILABLE_FUNCTIONS, SYSTEM_PROMPT, save_message
 
-# Preview ids rotate, so this is config, not code (README 4.3): set
-# ORACLE_GEMINI_LIVE_MODEL to override without editing this file.
-DEFAULT_MODEL = "gemini-live-2.5-flash-preview-native-audio-09-2025"
-MODEL = os.environ.get("ORACLE_GEMINI_LIVE_MODEL") or DEFAULT_MODEL
+# Live model ids rotate (README 4.3), so they're config with fallbacks: set
+# ORACLE_GEMINI_LIVE_MODEL to override. If a model is gone, the next one is
+# tried; the "-latest" alias is the last resort because it doesn't rotate.
+# Checked 2026-09-25: both fallbacks connect, call tools and speak.
+FALLBACK_MODELS = ["gemini-3.8-live", "gemini-2.5-flash-native-audio-latest"]
+_working_model = None
+
+
+def model_candidates() -> list:
+    ordered = [os.environ.get("ORACLE_GEMINI_LIVE_MODEL"), _working_model] + FALLBACK_MODELS
+    return list(dict.fromkeys(m for m in ordered if m))
+
+
+def remember_working_model(model: str):
+    global _working_model
+    _working_model = model
+
+
+MODEL = model_candidates()[0]
+
+
+async def connect_live(stack, config: dict):
+    """Enters a Live session on the first model that exists, via an
+    AsyncExitStack so errors after connecting don't trigger a fallback."""
+    last_error = None
+    for model in model_candidates():
+        try:
+            session = await stack.enter_async_context(_client.aio.live.connect(model=model, config=config))
+            remember_working_model(model)
+            return session
+        except Exception as e:
+            if "not found" not in str(e).lower() and "not supported" not in str(e).lower():
+                raise
+            print(f"Live model {model} unavailable, trying the next one.")
+            last_error = e
+    raise last_error
 
 INPUT_RATE = 16000    # what we send the mic at
 OUTPUT_RATE = 24000    # what Gemini's audio replies come back at
@@ -74,10 +107,16 @@ def _to_gemini_tools() -> list:
     return declarations
 
 
-def _live_config() -> dict:
+def system_instruction(text: str) -> types.Content:
+    """Typed rather than a plain {"parts": [...]} dict: with older pydantic
+    versions the dict gets validated as a Part and the connect fails."""
+    return types.Content(parts=[types.Part(text=text)])
+
+
+def _live_config(system_text: str = None) -> dict:
     return {
         "response_modalities": ["AUDIO"],
-        "system_instruction": {"parts": [{"text": core.SYSTEM_PROMPT}]},
+        "system_instruction": system_instruction(system_text or core.SYSTEM_PROMPT),
         "tools": [{"function_declarations": _to_gemini_tools()}],
         # Ask Gemini to also give us text transcripts of both sides of
         # the exchange - needed so we can save/display the turn in the
@@ -128,7 +167,8 @@ async def _run_turn(on_status=None, on_event=None) -> tuple:
 
     set_state("listening")
 
-    async with _client.aio.live.connect(model=MODEL, config=_live_config()) as session:
+    async with contextlib.AsyncExitStack() as stack:
+        session = await connect_live(stack, _live_config())
 
         async def send_mic():
             stream = sd.InputStream(samplerate=INPUT_RATE, channels=1, dtype="int16")
@@ -189,7 +229,9 @@ async def _run_turn(on_status=None, on_event=None) -> tuple:
                     stop_sending = asyncio.Event()
                     mic_task = asyncio.create_task(send_mic())
 
-                elif response.server_content:
+                # Not elif: newer Live models send transcripts in the same
+                # message as the audio chunk.
+                if response.server_content:
                     sc = response.server_content
                     if sc.input_transcription and sc.input_transcription.text:
                         user_text_parts.append(sc.input_transcription.text)
