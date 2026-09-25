@@ -166,6 +166,16 @@ def init_db():
             updated_at TEXT NOT NULL
         )
     """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS reminders (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            kind TEXT NOT NULL,             -- 'timer' or 'reminder'
+            message TEXT NOT NULL,
+            due_at TEXT NOT NULL,           -- local time, ISO 'YYYY-MM-DDTHH:MM:SS'
+            status TEXT NOT NULL DEFAULT 'pending',  -- pending | fired | cancelled | missed
+            created_at TEXT NOT NULL
+        )
+    """)
     # Migration: a DB created before conversation threading existed won't
     # have this column - old messages just end up with conversation_id
     # NULL (not deleted, just invisible to the new per-thread sidebar).
@@ -1470,6 +1480,231 @@ def open_url(url: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# TIMERS & REMINDERS (README 3.8, P1): stored in SQLite so they survive
+# restarts. oracle_server.py's scheduler fires them as a chime, a toast and
+# speech through the orb; this section is only storage and the tools.
+# ---------------------------------------------------------------------------
+
+def _describe_duration(seconds: int) -> str:
+    parts = []
+    for unit, size in (("hour", 3600), ("minute", 60), ("second", 1)):
+        n, seconds = divmod(seconds, size)
+        if n:
+            parts.append(f"{n} {unit}{'s' if n != 1 else ''}")
+    return " ".join(parts) or "0 seconds"
+
+
+def _add_reminder(kind: str, message: str, due: datetime) -> int:
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.execute(
+        "INSERT INTO reminders (kind, message, due_at, created_at) VALUES (?, ?, ?, ?)",
+        (kind, message, due.replace(microsecond=0).isoformat(), datetime.now().isoformat(timespec="seconds")),
+    )
+    conn.commit()
+    rid = cur.lastrowid
+    conn.close()
+    return rid
+
+
+def set_timer(hours: float = 0, minutes: float = 0, seconds: float = 0, label: str = "") -> str:
+    """Starts a countdown timer, e.g. minutes=10, or minutes=25 label='pasta'."""
+    total = int(round(float(hours or 0) * 3600 + float(minutes or 0) * 60 + float(seconds or 0)))
+    if total <= 0:
+        return "Error: the timer needs a length, e.g. minutes=10."
+    if total > 7 * 24 * 3600:
+        return "Error: timers can be at most a week; use a reminder for anything longer."
+    length = _describe_duration(total)
+    message = f"{label} timer" if label else f"timer for {length}"
+    due = datetime.now() + timedelta(seconds=total)
+    rid = _add_reminder("timer", message, due)
+    return f"Timer #{rid} set for {length}" + (f" ({label})" if label else "") + f", done at {due:%H:%M:%S}."
+
+
+def _parse_when(at: str) -> datetime:
+    """'18:00', '6:30 pm', '2026-09-27 18:00' or '2026-09-27T18:00'. A bare
+    time that has already passed today means tomorrow."""
+    text = at.strip().lower().replace("t", " ", 1) if re.match(r"^\d{4}-\d{2}-\d{2}t", at.strip().lower()) else at.strip().lower()
+    now = datetime.now()
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M"):
+        try:
+            return datetime.strptime(text, fmt)
+        except ValueError:
+            pass
+    for fmt in ("%H:%M", "%I:%M %p", "%I:%M%p", "%I %p", "%I%p"):
+        try:
+            t = datetime.strptime(text, fmt).time()
+        except ValueError:
+            continue
+        due = datetime.combine(now.date(), t)
+        return due if due > now else due + timedelta(days=1)
+    raise ValueError(f"couldn't understand the time '{at}' - use 'HH:MM' or 'YYYY-MM-DD HH:MM'")
+
+
+def set_reminder(message: str, at: str = "", in_minutes: float = 0) -> str:
+    """Reminds the owner of something at a time ('18:00', '2026-09-27 09:30')
+    or after a delay (in_minutes)."""
+    message = (message or "").strip()
+    if not message:
+        return "Error: what should I remind you about?"
+    try:
+        if at:
+            due = _parse_when(at)
+        elif in_minutes and float(in_minutes) > 0:
+            due = datetime.now() + timedelta(minutes=float(in_minutes))
+        else:
+            return "Error: give a time (at='18:00') or a delay (in_minutes=30)."
+    except ValueError as e:
+        return f"Error: {e}."
+    if due <= datetime.now():
+        return f"Error: {due:%Y-%m-%d %H:%M} is in the past."
+    rid = _add_reminder("reminder", message, due)
+    day = "today" if due.date() == datetime.now().date() else (
+        "tomorrow" if due.date() == datetime.now().date() + timedelta(days=1) else f"on {due:%A %d %B}")
+    return f"Reminder #{rid} set for {due:%H:%M} {day}: {message}"
+
+
+def list_reminders() -> str:
+    """Lists pending timers and reminders."""
+    conn = sqlite3.connect(DB_PATH)
+    rows = conn.execute(
+        "SELECT id, kind, message, due_at FROM reminders WHERE status = 'pending' ORDER BY due_at"
+    ).fetchall()
+    conn.close()
+    if not rows:
+        return "No timers or reminders are set."
+    now = datetime.now()
+    lines = []
+    for rid, kind, message, due_at in rows:
+        due = datetime.fromisoformat(due_at)
+        left = _describe_duration(max(0, int((due - now).total_seconds())))
+        lines.append(f"#{rid} {kind}: {message} - at {due:%a %H:%M} ({left} left)")
+    return "\n".join(lines)
+
+
+def cancel_reminder(reminder_id: int = None) -> str:
+    """Cancels a timer/reminder by id; with no id, cancels the only pending one."""
+    conn = sqlite3.connect(DB_PATH)
+    pending = conn.execute("SELECT id, kind, message FROM reminders WHERE status = 'pending'").fetchall()
+    if reminder_id is None:
+        if len(pending) != 1:
+            conn.close()
+            return ("Nothing to cancel." if not pending else
+                    "Several are set - say which:\n" + list_reminders())
+        reminder_id = pending[0][0]
+    match = [p for p in pending if p[0] == int(reminder_id)]
+    if not match:
+        conn.close()
+        return f"No pending timer or reminder #{reminder_id}."
+    conn.execute("UPDATE reminders SET status = 'cancelled' WHERE id = ?", (int(reminder_id),))
+    conn.commit()
+    conn.close()
+    return f"Cancelled {match[0][1]} #{reminder_id}: {match[0][2]}."
+
+
+def due_reminders(now: datetime = None) -> list:
+    """Pending timers/reminders whose time has come: [(id, kind, message, due)]."""
+    now = now or datetime.now()
+    conn = sqlite3.connect(DB_PATH)
+    rows = conn.execute(
+        "SELECT id, kind, message, due_at FROM reminders WHERE status = 'pending' AND due_at <= ? ORDER BY due_at",
+        (now.replace(microsecond=0).isoformat(),),
+    ).fetchall()
+    conn.close()
+    return [(r[0], r[1], r[2], datetime.fromisoformat(r[3])) for r in rows]
+
+
+def mark_reminder(reminder_id: int, status: str):
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute("UPDATE reminders SET status = ? WHERE id = ?", (status, reminder_id))
+    conn.commit()
+    conn.close()
+
+
+# ---------------------------------------------------------------------------
+# WEATHER (README 3.7, P1): Open-Meteo - free, no API key. Location is a
+# city name, or the saved home_location setting.
+# ---------------------------------------------------------------------------
+
+_WMO = {
+    0: "clear", 1: "mainly clear", 2: "partly cloudy", 3: "overcast", 45: "fog", 48: "freezing fog",
+    51: "light drizzle", 53: "drizzle", 55: "heavy drizzle", 56: "freezing drizzle", 57: "freezing drizzle",
+    61: "light rain", 63: "rain", 65: "heavy rain", 66: "freezing rain", 67: "freezing rain",
+    71: "light snow", 73: "snow", 75: "heavy snow", 77: "snow grains",
+    80: "light showers", 81: "showers", 82: "violent showers", 85: "snow showers", 86: "heavy snow showers",
+    95: "thunderstorms", 96: "thunderstorms with hail", 99: "thunderstorms with heavy hail",
+}
+
+
+def _geocode(location: str):
+    parts = [p.strip() for p in location.split(",") if p.strip()]
+    resp = requests.get(
+        "https://geocoding-api.open-meteo.com/v1/search",
+        params={"name": parts[0], "count": 10, "language": "en", "format": "json"}, timeout=10,
+    )
+    resp.raise_for_status()
+    results = resp.json().get("results") or []
+    if len(parts) > 1:
+        hint = parts[1].lower()
+        narrowed = [r for r in results if any(str(r.get(k, "")).lower().startswith(hint)
+                                             for k in ("country", "country_code", "admin1"))]
+        results = narrowed or results
+    return results[0] if results else None
+
+
+def set_home_location(location: str) -> str:
+    """Saves the owner's home city for weather, e.g. 'Prague' or 'Springfield, Illinois'."""
+    try:
+        place = _geocode(location)
+    except Exception as e:
+        return f"Error looking up '{location}': {e}"
+    if not place:
+        return f"Couldn't find a place called '{location}'."
+    label = ", ".join(x for x in (place.get("name"), place.get("admin1"), place.get("country")) if x)
+    set_setting("home_location", location)
+    return f"Home location saved: {label}."
+
+
+def get_weather(location: str = "", days: int = 1) -> str:
+    """Current weather plus a forecast for `days` days (1-7) for a city, or
+    the saved home location."""
+    location = (location or "").strip() or (get_setting("home_location") or "")
+    if not location:
+        return ("No home location is saved. Ask the owner which city they're in, "
+                "then call set_home_location with it.")
+    try:
+        place = _geocode(location)
+        if not place:
+            return f"Couldn't find a place called '{location}'."
+        days = max(1, min(7, int(days or 1)))
+        resp = requests.get("https://api.open-meteo.com/v1/forecast", params={
+            "latitude": place["latitude"], "longitude": place["longitude"], "timezone": "auto",
+            "current": "temperature_2m,apparent_temperature,weather_code,wind_speed_10m,relative_humidity_2m,precipitation",
+            "daily": "weather_code,temperature_2m_max,temperature_2m_min,precipitation_probability_max",
+            "forecast_days": days + 1,
+        }, timeout=10)
+        resp.raise_for_status()
+        data = resp.json()
+    except Exception as e:
+        return f"Error fetching the weather: {e}"
+
+    c, d = data["current"], data["daily"]
+    name = ", ".join(x for x in (place.get("name"), place.get("country")) if x)
+    lines = [
+        f"{name} now: {c['temperature_2m']:.0f}°C (feels like {c['apparent_temperature']:.0f}°C), "
+        f"{_WMO.get(c['weather_code'], 'unknown conditions')}, wind {c['wind_speed_10m']:.0f} km/h, "
+        f"humidity {c['relative_humidity_2m']}%."
+    ]
+    for i in range(min(days + 1, len(d["time"]))):
+        day = "Today" if i == 0 else ("Tomorrow" if i == 1 else datetime.fromisoformat(d["time"][i]).strftime("%A"))
+        rain = d["precipitation_probability_max"][i]
+        lines.append(
+            f"{day}: {d['temperature_2m_min'][i]:.0f} to {d['temperature_2m_max'][i]:.0f}°C, "
+            f"{_WMO.get(d['weather_code'][i], 'mixed')}" + (f", {rain}% chance of rain" if rain is not None else "") + "."
+        )
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
 # ALEXA-STYLE MEDIA: play a specific song, control playback, set volume.
 # Songs play on YouTube in the default browser (the owner's choice): yt-dlp
 # finds the top result without an API key, and a watch URL autoplays.
@@ -2456,6 +2691,87 @@ TOOLS = [
     {
         "type": "function",
         "function": {
+            "name": "set_timer",
+            "description": "Start a countdown timer, like a kitchen timer: 'set a 10 minute timer' -> minutes=10. Optional label, e.g. 'pasta'.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "hours": {"type": "number"},
+                    "minutes": {"type": "number"},
+                    "seconds": {"type": "number"},
+                    "label": {"type": "string", "description": "Optional name, e.g. 'pasta'."},
+                },
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "set_reminder",
+            "description": (
+                "Remind the owner of something later; it's announced out loud and as a notification. "
+                "Give either `at` (local time: 'HH:MM' for the next occurrence, or 'YYYY-MM-DD HH:MM' "
+                "for another day - call get_current_time first if you need today's date) or `in_minutes`."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "message": {"type": "string", "description": "What to remind them of, e.g. 'call Mum'."},
+                    "at": {"type": "string", "description": "e.g. '18:00' or '2026-09-27 09:30'."},
+                    "in_minutes": {"type": "number", "description": "e.g. 90 for 'in an hour and a half'."},
+                },
+                "required": ["message"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_reminders",
+            "description": "List the timers and reminders that are set, with time left.",
+            "parameters": {"type": "object", "properties": {}},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "cancel_reminder",
+            "description": "Cancel a timer or reminder by its number (from list_reminders). With no number, cancels the only one set.",
+            "parameters": {
+                "type": "object",
+                "properties": {"reminder_id": {"type": "integer"}},
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_weather",
+            "description": "Current weather and forecast. Leave location empty for the owner's home location. days=1 for today/tomorrow, up to 7 for the week.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "location": {"type": "string", "description": "City, optionally with country: 'Prague' or 'Paris, France'."},
+                    "days": {"type": "integer", "description": "Forecast days, 1-7."},
+                },
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "set_home_location",
+            "description": "Save the owner's home city for weather (when they tell you where they live).",
+            "parameters": {
+                "type": "object",
+                "properties": {"location": {"type": "string"}},
+                "required": ["location"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "play_music",
             "description": (
                 "Play a specific song, artist, album, playlist or kind of music, like a "
@@ -2718,6 +3034,12 @@ AVAILABLE_FUNCTIONS = {
     "web_search": web_search,
     "open_web_search": open_web_search,
     "open_url": open_url,
+    "set_timer": set_timer,
+    "set_reminder": set_reminder,
+    "list_reminders": list_reminders,
+    "cancel_reminder": cancel_reminder,
+    "get_weather": get_weather,
+    "set_home_location": set_home_location,
     "play_music": play_music,
     "media_control": media_control,
     "set_volume": set_volume,
@@ -3063,6 +3385,12 @@ TOOL_LABELS = {
     "web_search": "Searching the web…",
     "open_web_search": "Opening a search…",
     "open_url": "Opening the page…",
+    "set_timer": "Setting a timer…",
+    "set_reminder": "Setting a reminder…",
+    "list_reminders": "Checking your reminders…",
+    "cancel_reminder": "Cancelling it…",
+    "get_weather": "Checking the weather…",
+    "set_home_location": "Noting where you live…",
     "play_music": "Finding it on YouTube…",
     "media_control": "On it…",
     "set_volume": "Adjusting the volume…",
@@ -3106,8 +3434,10 @@ def set_confirm_handler(handler):
 # personal data, deletes, or runs commands.
 GUEST_SAFE_TOOLS = {
     "get_current_time", "web_search", "get_system_info", "launch_app", "open_web_search", "open_url",
-    # Like a smart speaker, anyone in the room can play music or change the volume.
-    "play_music", "media_control", "set_volume",
+    # Like a smart speaker, anyone in the room can play music, change the
+    # volume, set a timer or reminder, or ask about the weather. Listing or
+    # cancelling the owner's reminders stays owner-only.
+    "play_music", "media_control", "set_volume", "set_timer", "set_reminder", "get_weather",
 }
 
 

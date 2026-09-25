@@ -46,6 +46,7 @@ import secrets
 import sys
 import threading
 import time
+from datetime import datetime, timedelta
 from http import HTTPStatus
 from urllib.parse import urlparse, parse_qs
 
@@ -68,6 +69,17 @@ RPC_METHODS = {
     "rename_project", "delete_project", "toggle_pin_project",
     "get_system_stats", "start_recording", "stop_recording",
 }
+
+
+MISSED_REMINDER_HOURS = 12  # older ones missed while ORACLE was off are dropped
+
+
+def _reminder_speech(kind: str, message: str, due: datetime, late: timedelta) -> str:
+    if late > timedelta(minutes=2):
+        return f"While you were away, Sir: at {due:%H:%M} you asked me to remind you: {message}."
+    if kind == "timer":
+        return f"Time's up, Sir. Your {message} is done."
+    return f"Sir, a reminder: {message}."
 
 
 class Backend:
@@ -196,6 +208,39 @@ class Backend:
         self.emit(event)
         self._on_voice_state(event)
 
+    # ---- timers & reminders ----
+
+    def start_reminders(self):
+        threading.Thread(target=self._reminder_loop, daemon=True, name="reminders").start()
+
+    def _reminder_loop(self):
+        """Fires due timers/reminders: a toast right away, plus a chime and
+        speech through the orb as soon as nothing else is using it (never
+        over a conversation). Ones missed while ORACLE was off are announced
+        at startup if they're less than MISSED_REMINDER_HOURS old."""
+        announced_toast = set()
+        while True:
+            try:
+                for rid, kind, message, due in core.due_reminders():
+                    late = datetime.now() - due
+                    if late > timedelta(hours=MISSED_REMINDER_HOURS):
+                        core.mark_reminder(rid, "missed")
+                        continue
+                    title = "Timer" if kind == "timer" else "Reminder"
+                    if rid not in announced_toast:
+                        core.send_notification(f"ORACLE {title.lower()}", message)
+                        announced_toast.add(rid)
+                    text = _reminder_speech(kind, message, due, late)
+                    if self.voice is None or not self.voice.mic.running:
+                        core.mark_reminder(rid, "fired")  # no voice: the toast is it
+                        self.emit({"type": "caption", "text": text})
+                    elif self.voice.announce(text, label=title.upper()):
+                        core.mark_reminder(rid, "fired")
+                    break  # one at a time; the next waits for this announcement
+            except Exception as e:
+                print(f"Reminder check failed: {e}", file=sys.stderr)
+            time.sleep(1)
+
     def start_voice(self):
         from voice_engine import VoiceEngine  # heavy imports: only when voice is used
         self.voice = VoiceEngine(self._emit_voice, self.session)
@@ -312,6 +357,7 @@ def main():
     backend = Backend(port=args.port)
     if not args.no_voice:
         backend.start_voice()
+    backend.start_reminders()
     try:
         asyncio.run(backend.run())
     except KeyboardInterrupt:

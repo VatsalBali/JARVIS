@@ -853,7 +853,12 @@ class Conversation:
         self.loop = asyncio.get_running_loop()
         self.done = asyncio.Event()
         self.player = Player()
-        config = gemini_voice._live_config(core.SYSTEM_PROMPT + VOICE_STYLE)
+        # The date and time let "remind me at 6" / "tomorrow" resolve without
+        # an extra get_current_time round trip.
+        config = gemini_voice._live_config(
+            core.SYSTEM_PROMPT + VOICE_STYLE
+            + f" The current local date and time is {datetime.now():%A %d %B %Y, %H:%M}."
+        )
         self.engine.ducker.duck()
         self._set_mode("listening")
         try:
@@ -875,6 +880,41 @@ class Conversation:
             self.player.close()
             self._write_log()
             self.engine.ducker.restore()
+
+
+def _chime() -> bytes:
+    """Two soft rising tones (24 kHz int16) that open an announcement."""
+    out = []
+    for freq, dur in ((880, 0.14), (1320, 0.28)):
+        t = np.arange(int(OUTPUT_RATE * dur)) / OUTPUT_RATE
+        env = np.minimum(1, t / 0.01) * np.exp(-t / (dur / 2.5))
+        out.append(np.sin(2 * np.pi * freq * t) * env * 9000)
+    out.append(np.zeros(int(OUTPUT_RATE * 0.15)))
+    return np.concatenate(out).astype(np.int16).tobytes()
+
+
+async def _speak(text: str) -> bytes:
+    """Speaks `text` in ORACLE's configured Live voice and returns the PCM."""
+    # A Live model treats text as something said *to* it and replies ("I'll
+    # check on the pasta"), so it's framed as a script to read verbatim.
+    config = gemini_voice._live_config(
+        "You are a text-to-speech voice. You never converse, answer or comment: "
+        "you only read aloud, word for word, the text between the quotation marks "
+        "you are given, and then stop." + VOICE_STYLE
+    )
+    config["tools"] = []
+    pcm = bytearray()
+    async with contextlib.AsyncExitStack() as stack:
+        session = await gemini_voice.connect_live(stack, config)
+        await session.send_client_content(
+            turns=types.Content(role="user", parts=[types.Part(
+                text=f'Read this aloud exactly, and nothing else: "{text}"')]),
+            turn_complete=True,
+        )
+        async for response in session.receive():
+            if response.data:
+                pcm += gemini_voice.pcm_bytes(response.data)
+    return bytes(pcm)
 
 
 # ---------------------------------------------------------------------------
@@ -1031,6 +1071,46 @@ class VoiceEngine:
             if not ok and self.voice_id.enrolled:
                 return None  # a short "yes" is hard to verify; fall back to the click
         return verdict
+
+    # ---- announcements (timers, reminders) ----
+
+    def announce(self, text: str, label: str = "REMINDER") -> bool:
+        """Chime + spoken announcement through the orb. Returns False (try
+        again later) if a conversation, enrolment or announcement is running."""
+        if not self._busy.acquire(blocking=False):
+            return False
+        threading.Thread(target=self._announce, args=(text, label), daemon=True, name="announce").start()
+        return True
+
+    def _announce(self, text: str, label: str):
+        player = None
+        try:
+            self.emit({"type": "state", "state": "speaking", "label": label})
+            self.emit({"type": "caption", "text": text})
+            player = Player()
+            self.ducker.duck()
+            player.write(_chime())
+            player.end_turn()
+            try:
+                speech = asyncio.run(asyncio.wait_for(_speak(text), timeout=15))
+            except Exception as e:
+                print(f"Announcement speech failed (chime and caption only): {e}")
+                speech = b""
+            if speech:
+                player.write(speech)
+                player.end_turn()
+            while player.busy:
+                self.emit({"type": "level", "value": player.level})
+                time.sleep(0.1)
+            time.sleep(OUTPUT_LATENCY + 0.4)
+        except Exception as e:
+            print(f"Announcement failed: {e}")
+        finally:
+            if player:
+                player.close()
+            self.ducker.restore()
+            self._busy.release()
+            self.emit({"type": "state", "state": "asleep"})
 
     # ---- enrolment ----
 
