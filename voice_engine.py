@@ -55,7 +55,7 @@ SPEECH_PROB = 0.5                 # Silero VAD speech probability threshold
 SPEECH_RMS_FLOOR = 0.006          # ...and at least this loud (drops very distant voices)
 FOLLOWUP_MAX_SEC = 15.0           # speech can stretch the follow-up window, but no further
 LISTEN_MAX_SEC = 45.0             # one request can't hold the mic open longer than this
-FOLLOWUP_SEC = 6.0                # README 4.1: keep listening ~6 s after a reply
+FOLLOWUP_SEC = 6.0                # suggested value for the followup_seconds setting (default 0: off)
 STOP_DEBOUNCE_SEC = 0.7
 DUCK_LEVEL = 0.3                  # other apps' volume while ORACLE talks
 VOICE_ID_THRESHOLD = 0.75         # cosine similarity; tune via the voice_id_threshold setting
@@ -338,8 +338,10 @@ def _voiced(frame: np.ndarray, floor: float) -> bool:
 # Audio out + ducking
 # ---------------------------------------------------------------------------
 
-PREBUFFER_SEC = 0.2   # jitter buffer before (re)starting playback
+PREBUFFER_SEC = 0.08  # jitter buffer before (re)starting playback; Gemini
+                      # sends audio ~5x faster than real time, so little is needed
 FADE_SAMPLES = 120    # 5 ms fades where playback starts/stops, so no clicks
+OUTPUT_LATENCY = 0.1  # device buffer; "high" was 0.2 s of extra delay
 
 
 class Player:
@@ -363,7 +365,7 @@ class Player:
         self._prebuffer = int(OUTPUT_RATE * PREBUFFER_SEC) * 2
         self._stream = sd.OutputStream(
             samplerate=OUTPUT_RATE, channels=1, dtype="int16",
-            blocksize=int(OUTPUT_RATE * 0.05), latency="high", callback=self._callback,
+            blocksize=int(OUTPUT_RATE * 0.05), latency=OUTPUT_LATENCY, callback=self._callback,
         )
         self._stream.start()
 
@@ -411,10 +413,19 @@ class Player:
         with self._lock:
             self._ended = True
 
-    def flush(self):
+    def flush(self) -> int:
+        """Drops queued audio; returns how many bytes were discarded."""
         with self._lock:
+            dropped = len(self._buf)
             self._buf.clear()
             self._playing = False
+            return dropped
+
+    @property
+    def heard_bytes(self) -> int:
+        """Bytes that have actually come out of the speaker (roughly: handed
+        to the device minus its buffer)."""
+        return max(0, self.played_samples - int(OUTPUT_LATENCY * OUTPUT_RATE)) * 2
 
     @property
     def busy(self) -> bool:
@@ -499,10 +510,17 @@ class Conversation:
         self.tool_running = False
         self.followup_until = 0.0
         self.followup_started = 0.0
+        # 0 = one command per wake word (default); >0 keeps listening that many
+        # seconds after a reply without needing the wake word (README 4.1).
+        self.followup_sec = float(core.get_setting("followup_seconds") or 0)
+        self.drain_done_at = 0.0
+        self.awaiting_answer = False  # tool result sent, spoken answer not yet received
         self.last_transcript_at = 0.0
         self.is_speech = SpeechDetector()
         self.user_parts = []
         self.reply_parts = []
+        self.caption_marks = []       # (audio byte position, caption text so far)
+        self.skipped_bytes = 0        # received audio that was dropped, not played
         self.turn_audio = []          # this turn's user audio
         self.voiced_audio = deque(maxlen=12 * FRAMES_PER_SEC)  # speech only, for voice ID
         self._verified = None         # cached per turn
@@ -551,6 +569,8 @@ class Conversation:
             "rebuffers": p.rebuffers if p else 0,
             "underflows": p.underflows if p else 0,
             "gated_s": round(self.stats["gated_frames"] / FRAMES_PER_SEC, 1),
+            # + PREBUFFER_SEC + OUTPUT_LATENCY until it's audible
+            "reply_delay_s": self.stats.get("reply_delays", []),
             "events": self.events,
         }
         try:
@@ -567,11 +587,26 @@ class Conversation:
         if self.mode not in ("thinking", "speaking", "draining"):
             return
         self._event("barge_in")
-        self.player.flush()
+        self._skip_queued_audio()
         # Only a turn still in progress will send a turn_complete to skip.
         self.barged = self.mode in ("speaking", "thinking")
         self.drop_audio = self.barged
         self._start_listening()
+
+    def _skip_queued_audio(self):
+        """Drops unplayed audio and the captions that went with it, keeping
+        caption positions aligned with what's actually heard."""
+        self.skipped_bytes += self.player.flush()
+        self.caption_marks = []
+
+    def _show_captions(self, everything: bool = False):
+        """Reveals each caption once the voice has reached its audio."""
+        heard = self.player.heard_bytes + self.skipped_bytes
+        text = None
+        while self.caption_marks and (everything or self.caption_marks[0][0] <= heard):
+            text = self.caption_marks.pop(0)[1]
+        if text:
+            self.emit({"type": "caption", "text": text})
 
     def _start_listening(self):
         self.sending = True
@@ -660,8 +695,9 @@ class Conversation:
         while not self.done.is_set():
             await asyncio.sleep(0.1)
             now = time.monotonic()
-            if self.mode == "speaking":
+            if self.mode in ("speaking", "draining"):
                 self.emit({"type": "level", "value": self.player.level})
+                self._show_captions()
             if self.mode == "listening" and not self.heard_speech and now - self.listen_started > NO_SPEECH_SEC:
                 self._end()
             elif self.mode == "listening" and self.heard_speech and now - self.last_voice_at > NO_REPLY_SEC:
@@ -672,14 +708,23 @@ class Conversation:
             elif (self.mode == "thinking" and not self.tool_running
                     and now - self.last_server_at > NO_REPLY_SEC):
                 self._end()  # waiting on an answer that never came
+            elif self.mode == "draining" and not self.player.busy and self.followup_sec <= 0:
+                # One command per wake (the owner's choice): once the reply
+                # has left the device buffer, go back to sleep.
+                self._show_captions(everything=True)
+                if not self.drain_done_at:
+                    self.drain_done_at = now
+                elif now - self.drain_done_at >= OUTPUT_LATENCY + 0.1:
+                    self._end()
             elif self.mode == "draining" and not self.player.busy:
                 # Reply finished playing: listen for a follow-up without the
                 # wake word. Starting only now keeps ORACLE from hearing itself.
+                self._show_captions(everything=True)
                 self.sending = True
                 self.turn_audio = []
                 self.heard_speech = False
                 self.followup_started = now
-                self.followup_until = now + FOLLOWUP_SEC
+                self.followup_until = now + self.followup_sec
                 self._set_mode("followup")
                 self.engine.ducker.restore()
             elif self.mode == "followup" and not self.heard_speech and now > self.followup_until:
@@ -696,7 +741,13 @@ class Conversation:
             async for response in session.receive():
                 got_any = True
                 self.last_server_at = time.monotonic()
+                chunk_start = self.stats["audio_bytes"]  # where this message's audio begins
                 if response.data is not None and not self.drop_audio:
+                    if self.mode in ("listening", "thinking") and self.heard_speech:
+                        # From when the owner stopped talking to the first
+                        # reply audio: the pause they actually sit through.
+                        self.stats.setdefault("reply_delays", []).append(
+                            round(time.monotonic() - self.last_voice_at, 2))
                     if self.mode != "speaking":
                         self.sending = False  # no mic to Gemini while it talks (no echo cancel)
                         self._set_mode("speaking")
@@ -706,6 +757,7 @@ class Conversation:
                         self._event("first_audio")
                     self.stats["audio_bytes"] += len(pcm)
                     self.player.write(pcm)
+                    self.awaiting_answer = False
 
                 elif response.tool_call:
                     self.sending = False
@@ -723,6 +775,7 @@ class Conversation:
                         self.tool_running = False
                         self.last_server_at = time.monotonic()
                     await session.send_tool_response(function_responses=responses)
+                    self.awaiting_answer = True  # the spoken answer to the tool result is still coming
 
                 # Not elif: newer Live models send transcripts in the same
                 # message as the audio chunk.
@@ -731,7 +784,7 @@ class Conversation:
                     if sc.interrupted:
                         # Gemini abandoned this reply (it heard the owner, or
                         # noise). Drop its audio and its text: it won't be said.
-                        self.player.flush()
+                        self._skip_queued_audio()
                         self.drop_audio = False
                         self.reply_parts = []
                         self._event("interrupted_by_server")
@@ -746,7 +799,9 @@ class Conversation:
                     if sc.output_transcription and sc.output_transcription.text:
                         self.reply_parts.append(sc.output_transcription.text)
                         if not self.drop_audio:
-                            self.emit({"type": "caption", "text": "".join(self.reply_parts).strip()})
+                            # Text arrives ~5x faster than it's spoken; show
+                            # it when the voice gets there (see _watchdog).
+                            self.caption_marks.append((chunk_start, "".join(self.reply_parts).strip()))
                     if sc.generation_complete or sc.turn_complete:
                         self.player.end_turn()
                     if sc.turn_complete:
@@ -759,10 +814,16 @@ class Conversation:
                             self._finish_turn(final=True)
                             self.barged = False
                             continue
+                        if self.awaiting_answer:
+                            # A tool result was sent and nothing has been said
+                            # since: the answer is still coming. Keep the turn
+                            # open (what was said before the tool stays queued).
+                            if self.mode != "speaking":
+                                self._set_mode("thinking")
+                            continue
                         replied = self._finish_turn()
                         if not replied and self.user_parts:
-                            # Silent turn after a tool call: the answer is
-                            # still coming, so don't open the follow-up yet.
+                            # Silent turn with nothing to say yet.
                             self._set_mode("thinking")
                         else:
                             # Let the reply finish playing, then the watchdog

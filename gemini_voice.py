@@ -156,6 +156,18 @@ def _live_config(system_text: str = None) -> dict:
     if voice:
         config["speech_config"] = types.SpeechConfig(voice_config=types.VoiceConfig(
             prebuilt_voice_config=types.PrebuiltVoiceConfig(voice_name=voice)))
+    # Responsiveness. Measured 2026-09-26: no thinking cuts first-audio time
+    # from 0.88 s to 0.64 s on gemini-3.8-live - voice commands rarely need it
+    # (set voice_thinking=on to restore). A 500 ms silence ends the owner's
+    # turn instead of Gemini's longer default wait.
+    if (core.get_setting("voice_thinking") or "off").lower() != "on":
+        config["thinking_config"] = types.ThinkingConfig(thinking_budget=0)
+    config["realtime_input_config"] = types.RealtimeInputConfig(
+        automatic_activity_detection=types.AutomaticActivityDetection(
+            end_of_speech_sensitivity=types.EndSensitivity.END_SENSITIVITY_HIGH,
+            silence_duration_ms=int(core.get_setting("voice_end_silence_ms") or 500),
+        )
+    )
     return config
 
 
