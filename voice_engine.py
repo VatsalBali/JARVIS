@@ -445,8 +445,12 @@ class Conversation:
     asyncio loop on a worker thread; other threads talk to it via
     barge_in() and end()."""
 
-    def __init__(self, engine, wake_audio: np.ndarray):
+    def __init__(self, engine, wake_audio: np.ndarray, trusted: bool = False):
         self.engine = engine
+        # Started by hotkey/tray: a keypress on this PC is the same proof of
+        # presence as clicking Yes, so voice ID isn't needed. Wake-word
+        # conversations must pass voice ID for anything personal.
+        self.trusted = trusted
         self.emit = engine.emit
         self.mic_q = engine.mic.subscribe(maxsize=200)
         self.wake_audio = wake_audio
@@ -482,7 +486,7 @@ class Conversation:
 
     @property
     def speaker_verified_now(self) -> bool:
-        return bool(self._verified)
+        return self.trusted or bool(self._verified)
 
     # ---- helpers (loop thread unless noted) ----
 
@@ -514,6 +518,8 @@ class Conversation:
         speech frames (as enrolment does) - silence and room noise in the
         sample drag the similarity down - from the wake word plus everything
         said in this conversation, so short follow-ups have enough audio."""
+        if self.trusted:
+            return True
         if self._verified is None:
             wake = [f for f in _frames(self.wake_audio) if _voiced(f, LOCAL_VAD_FLOOR)]
             parts = wake + list(self.voiced_audio)
@@ -764,15 +770,16 @@ class VoiceEngine:
             return
         conv = self.conversation
         if conv is not None:
+            conv.trusted = True  # the owner pressed the key mid-conversation
             conv.barge_in()
         else:
-            self._start_conversation(np.zeros(0, dtype=np.int16))
+            self._start_conversation(np.zeros(0, dtype=np.int16), trusted=True)
 
-    def _start_conversation(self, wake_audio: np.ndarray):
+    def _start_conversation(self, wake_audio: np.ndarray, trusted: bool = False):
         if not self.mic.running or not self._busy.acquire(blocking=False):
             return
         self.emit({"type": "state", "state": "wake"})
-        conv = Conversation(self, wake_audio)
+        conv = Conversation(self, wake_audio, trusted=trusted)
         self.conversation = conv
 
         def run():
@@ -861,7 +868,8 @@ class VoiceEngine:
             return None
         self.emit({"type": "transcript", "text": text, "final": True})
         verdict = False if NO_WORDS.search(text) else (True if YES_WORDS.search(text) else None)
-        if verdict:
+        conv = self.conversation
+        if verdict and not (conv is not None and conv.trusted):
             ok, _ = self.voice_id.verify(pcm)
             if not ok and self.voice_id.enrolled:
                 return None  # a short "yes" is hard to verify; fall back to the click

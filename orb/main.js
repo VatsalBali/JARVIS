@@ -193,8 +193,36 @@ ipcMain.on('orb-front', (_e, front) => {
   }
 });
 
-ipcMain.on('orb-mouse', (_e, interactive) => {
-  if (orb && !orb.isDestroyed()) orb.setIgnoreMouseEvents(!interactive, { forward: true });
+// Clickable Yes/No on a click-through window. Relying on forwarded hover
+// events is unreliable on Windows (forwarding stops after the window has
+// been hidden and shown), so while a confirmation is up we poll the cursor
+// and make the window clickable only while it's over the box.
+let hitbox = null;      // {x, y, w, h} in window CSS px, or null
+let hitTimer = null;
+let clickable = false;
+
+function setClickable(on) {
+  if (clickable === on || !orb || orb.isDestroyed()) return;
+  clickable = on;
+  orb.setIgnoreMouseEvents(!on, { forward: true });
+}
+
+function pollHitbox() {
+  if (!hitbox || !orb || orb.isDestroyed() || !orb.isVisible()) return setClickable(false);
+  const c = screen.getCursorScreenPoint();
+  const b = orb.getContentBounds();
+  const x = c.x - b.x, y = c.y - b.y;
+  setClickable(x >= hitbox.x && x <= hitbox.x + hitbox.w && y >= hitbox.y && y <= hitbox.y + hitbox.h);
+}
+
+ipcMain.on('orb-hitbox', (_e, rect) => {
+  hitbox = rect;
+  if (rect && !hitTimer) hitTimer = setInterval(pollHitbox, 30);
+  if (!rect) {
+    clearInterval(hitTimer);
+    hitTimer = null;
+    setClickable(false);
+  }
 });
 
 ipcMain.on('orb-muted', (_e, value) => {
@@ -214,6 +242,29 @@ app.whenReady().then(async () => {
   if (app.isPackaged) app.setLoginItemSettings({ openAtLogin: true });
 
   createOrb();
+  if (process.env.ORACLE_ORB_SELFTEST) {
+    // Puts up a fake confirmation (its reply is ignored by the backend) and
+    // logs the window's clickable state, for testing the Yes/No hit-testing.
+    orb.webContents.once('did-finish-load', () => setTimeout(() => {
+      orb.webContents.send('debug-event', {
+        type: 'confirm', id: 'selftest', tier: 'confirm',
+        action: 'Self-test: click Yes', details: 'This confirmation is a test.',
+      });
+      orb.webContents.executeJavaScript(`
+        for (const t of ['pointerdown', 'mousedown', 'mouseup', 'click'])
+          document.addEventListener(t, (e) => console.log('[selftest] dom ' + t + ' on ' + (e.target.id || e.target.tagName)), true);
+      `);
+      orb.on('focus', () => console.log('[selftest] window focus'));
+      setInterval(async () => {
+        const yes = await orb.webContents.executeJavaScript(
+          "JSON.stringify(document.getElementById('confirm-yes').getBoundingClientRect())");
+        console.log('[selftest] ' + JSON.stringify({
+          hitbox, clickable, bounds: orb.getContentBounds(), yes: JSON.parse(yes),
+          scale: screen.getPrimaryDisplay().scaleFactor,
+        }));
+      }, 500);
+    }, 3000));
+  }
   tray = new Tray(trayIcon());
   tray.on('click', () => sendToBackend({ type: 'talk' }));
   refreshTray();

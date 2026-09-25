@@ -92,6 +92,14 @@
     captionsEl.classList.add('confirming');
     if (bridge) bridge.setFront(true);
     show();
+    reportHitbox();
+    setTimeout(reportHitbox, 400); // again once the fade-in scale settles
+  }
+
+  function reportHitbox() {
+    if (!bridge || !pendingConfirm) return;
+    const r = confirmEl.getBoundingClientRect();
+    bridge.setHitbox({ x: r.left, y: r.top, w: r.width, h: r.height });
   }
 
   function closeConfirm(id) {
@@ -100,7 +108,7 @@
     confirmEl.hidden = true;
     captionsEl.classList.remove('confirming');
     if (bridge) {
-      bridge.setInteractive(false);
+      bridge.setHitbox(null);
       bridge.setFront(false);
     }
     if (state === 'asleep') hideSoon();
@@ -108,15 +116,20 @@
 
   function answer(ok) {
     if (!pendingConfirm) return;
+    console.log('confirmation answered: ' + (ok ? 'yes' : 'no'));
     send({ type: 'confirm_reply', id: pendingConfirm, ok });
     closeConfirm();
   }
 
-  yesBtn.addEventListener('click', () => answer(true));
-  noBtn.addEventListener('click', () => answer(false));
-  // The window is click-through; accept clicks only while over the box.
-  confirmEl.addEventListener('mouseenter', () => bridge && bridge.setInteractive(true));
-  confirmEl.addEventListener('mouseleave', () => bridge && bridge.setInteractive(false));
+  // The window is click-through; the main process makes the box clickable
+  // while the cursor is over it (see reportHitbox / main.js pollHitbox).
+  // Buttons act on mouseup: the orb never takes focus, and on Windows a
+  // non-focusable window loses the mousedown, so 'click' never fires.
+  // answer() ignores the second call if a click does arrive too.
+  for (const [btn, ok] of [[yesBtn, true], [noBtn, false]]) {
+    btn.addEventListener('mouseup', (e) => { if (e.button === 0) answer(ok); });
+    btn.addEventListener('click', () => answer(ok));
+  }
 
   // ---- backend socket ----
 
@@ -190,6 +203,7 @@
     };
     open();
     bridge.onCommand(send);
+    bridge.onDebugEvent(handle); // ORACLE_ORB_SELFTEST only
   }
 
   // ---- demo (browser preview only) ----
