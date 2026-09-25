@@ -24,7 +24,8 @@ webrtcvad-wheels   # prebuilt webrtcvad for Windows; install before resemblyzer
 librosa
 # resemblyzer: install with `pip install resemblyzer --no-deps` so it doesn't
 # try to compile webrtcvad (webrtcvad-wheels above provides it). Needs torch.
-pycaw              # ducks other apps' volume while ORACLE listens/speaks
+pycaw              # ducks other apps' volume while ORACLE listens/speaks; set_volume
+yt-dlp             # play_music: finds the YouTube video for a song, no API key
 
 # piper-tts removed: was only used by core.speak(), which the ring-click
 # flow no longer calls (see gemini_voice.py). faster-whisper/sounddevice

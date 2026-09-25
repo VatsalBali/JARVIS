@@ -52,7 +52,10 @@ SYSTEM_PROMPT = (
     "your responses, it doesn't pad them out. When a question needs real information "
     "about this machine or the world, call a tool instead of guessing. To open an "
     "application (like Notepad, Chrome, or Spotify), call launch_app directly with the "
-    "app name - do not use list_files or open_file to search for it first. For "
+    "app name - do not use list_files or open_file to search for it first. To play "
+    "music (a song, artist or genre), call play_music - it plays on YouTube - rather "
+    "than launching Spotify; use media_control for pause/skip and set_volume for "
+    "volume, like a smart speaker would. For "
     "non-trivial coding help - writing code, debugging, explaining code, "
     "architecture questions - use ask_coding_agent to consult a coding "
     "specialist rather than answering directly yourself. "
@@ -1467,6 +1470,75 @@ def open_url(url: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# ALEXA-STYLE MEDIA: play a specific song, control playback, set volume.
+# Songs play on YouTube in the default browser (the owner's choice): yt-dlp
+# finds the top result without an API key, and a watch URL autoplays.
+# ---------------------------------------------------------------------------
+
+def play_music(query: str) -> str:
+    """Finds a song, artist, album or mix on YouTube and starts playing the
+    top result in the browser, e.g. "Toxic Britney Spears" or "lofi hip hop"."""
+    query = (query or "").strip()
+    if not query:
+        return "Error: say what to play."
+    try:
+        import yt_dlp
+        opts = {"quiet": True, "no_warnings": True, "extract_flat": "in_playlist", "skip_download": True}
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            entries = ydl.extract_info(f"ytsearch1:{query}", download=False).get("entries") or []
+    except Exception as e:
+        entries = []
+        print(f"YouTube lookup failed: {e}")
+    if not entries:
+        # Couldn't resolve a video: at least show the results page.
+        webbrowser.open(f"https://www.youtube.com/results?search_query={quote_plus(query)}", new=2)
+        return f"Couldn't pick a specific video, so I opened YouTube results for '{query}'."
+    video = entries[0]
+    webbrowser.open(f"https://www.youtube.com/watch?v={video['id']}", new=2)
+    channel = video.get("channel") or video.get("uploader") or "YouTube"
+    return f"Now playing '{video.get('title', query)}' ({channel}) on YouTube."
+
+
+_MEDIA_KEYS = {"play_pause": 0xB3, "next": 0xB0, "previous": 0xB1, "stop": 0xB2}
+
+
+def media_control(action: str) -> str:
+    """Play/pause, next, previous or stop for whatever is playing (YouTube in
+    the browser, Spotify, etc.), via the Windows media keys."""
+    action = (action or "").strip().lower().replace("/", "_").replace(" ", "_")
+    action = {"pause": "play_pause", "play": "play_pause", "resume": "play_pause",
+              "skip": "next", "back": "previous", "prev": "previous"}.get(action, action)
+    vk = _MEDIA_KEYS.get(action)
+    if vk is None:
+        return f"Error: unknown media action '{action}'. Use play_pause, next, previous or stop."
+    import ctypes
+    KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP = 0x1, 0x2
+    ctypes.windll.user32.keybd_event(vk, 0, KEYEVENTF_EXTENDEDKEY, 0)
+    ctypes.windll.user32.keybd_event(vk, 0, KEYEVENTF_EXTENDEDKEY | KEYEVENTF_KEYUP, 0)
+    return f"Sent {action.replace('_', '/')}."
+
+
+def set_volume(level: int = None, change: int = None, mute: bool = None) -> str:
+    """Sets the system volume: an absolute level (0-100), a relative change
+    (e.g. +10 / -20), and/or mute (true/false)."""
+    try:
+        from pycaw.pycaw import AudioUtilities
+        vol = AudioUtilities.GetSpeakers().EndpointVolume
+        current = round(vol.GetMasterVolumeLevelScalar() * 100)
+        if level is not None or change is not None:
+            target = int(level) if level is not None else current + int(change)
+            target = max(0, min(100, target))
+            vol.SetMasterVolumeLevelScalar(target / 100, None)
+            current = target
+        if mute is not None:
+            vol.SetMute(1 if mute else 0, None)
+        muted = bool(vol.GetMute())
+        return f"Volume is {current}%" + (" (muted)." if muted else ".")
+    except Exception as e:
+        return f"Error setting volume: {e}"
+
+
+# ---------------------------------------------------------------------------
 # VOICE INPUT: local, free speech-to-text via faster-whisper. Recording
 # happens entirely in Python (via sounddevice) rather than in the browser -
 # this keeps audio capture and transcription in one place instead of
@@ -2384,6 +2456,54 @@ TOOLS = [
     {
         "type": "function",
         "function": {
+            "name": "play_music",
+            "description": (
+                "Play a specific song, artist, album, playlist or kind of music, like a "
+                "smart speaker: finds it on YouTube and starts playing it in the browser. "
+                "Use this for any 'play ...' request (e.g. 'play Toxic by Britney Spears', "
+                "'play some AC/DC', 'play lofi') instead of launch_app or open_url."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "What to play, e.g. 'Toxic Britney Spears' or 'lofi hip hop mix'."}
+                },
+                "required": ["query"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "media_control",
+            "description": "Pause/resume, skip to the next track, go back, or stop whatever is playing (YouTube, Spotify, etc.).",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "action": {"type": "string", "enum": ["play_pause", "next", "previous", "stop"]}
+                },
+                "required": ["action"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "set_volume",
+            "description": "Set or change the computer's volume, or mute/unmute it. E.g. 'volume 30' -> level=30, 'turn it up' -> change=10, 'mute' -> mute=true.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "level": {"type": "integer", "description": "Absolute volume 0-100."},
+                    "change": {"type": "integer", "description": "Relative change, e.g. 10 or -10."},
+                    "mute": {"type": "boolean", "description": "true to mute, false to unmute."},
+                },
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "open_url",
             "description": (
                 "Opens a specific website in the user's default browser - use this "
@@ -2598,6 +2718,9 @@ AVAILABLE_FUNCTIONS = {
     "web_search": web_search,
     "open_web_search": open_web_search,
     "open_url": open_url,
+    "play_music": play_music,
+    "media_control": media_control,
+    "set_volume": set_volume,
     "send_notification": send_notification,
     "list_recent_emails": list_recent_emails,
     "read_email": read_email,
@@ -2940,6 +3063,9 @@ TOOL_LABELS = {
     "web_search": "Searching the web…",
     "open_web_search": "Opening a search…",
     "open_url": "Opening the page…",
+    "play_music": "Finding it on YouTube…",
+    "media_control": "On it…",
+    "set_volume": "Adjusting the volume…",
     "send_notification": "Sending a notification…",
     "list_recent_emails": "Checking your inbox…",
     "read_email": "Reading the email…",
@@ -2978,7 +3104,11 @@ def set_confirm_handler(handler):
 # (README 4.3, voice identification): time, weather, general questions,
 # plus opening an app, a web page or a web search - nothing that reads or sends
 # personal data, deletes, or runs commands.
-GUEST_SAFE_TOOLS = {"get_current_time", "web_search", "get_system_info", "launch_app", "open_web_search", "open_url"}
+GUEST_SAFE_TOOLS = {
+    "get_current_time", "web_search", "get_system_info", "launch_app", "open_web_search", "open_url",
+    # Like a smart speaker, anyone in the room can play music or change the volume.
+    "play_music", "media_control", "set_volume",
+}
 
 
 def execute_tool(fn_map: dict, fn_name: str, raw_args, speaker_verified=None) -> str:
