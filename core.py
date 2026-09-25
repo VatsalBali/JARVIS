@@ -2974,12 +2974,22 @@ def set_confirm_handler(handler):
     _confirm_handler = handler or _terminal_confirm
 
 
-def execute_tool(fn_map: dict, fn_name: str, raw_args) -> str:
+# What an unrecognised voice may use without the owner's approval
+# (README 4.3, voice identification): time, weather, general questions.
+GUEST_SAFE_TOOLS = {"get_current_time", "web_search", "get_system_info"}
+
+
+def execute_tool(fn_map: dict, fn_name: str, raw_args, speaker_verified=None) -> str:
     """
     Runs one tool call safely: parses arguments, asks for confirmation when
     the tool's tier requires it, and turns any exception into an error string
     for the model instead of crashing the turn. raw_args is the JSON string
     from Groq or a dict from Gemini.
+
+    speaker_verified: for voice turns, a callable returning whether the
+    speaker's voice matched the owner's. An unverified voice gets only
+    GUEST_SAFE_TOOLS; anything else needs the owner's click, and spoken
+    "yes" isn't offered for it.
     """
     fn = fn_map.get(fn_name)
     if fn is None:
@@ -2996,17 +3006,35 @@ def execute_tool(fn_map: dict, fn_name: str, raw_args) -> str:
         return f"Error: the arguments for {fn_name} must be a JSON object."
 
     rule = TOOL_TIERS.get(fn_name)
-    if rule and rule.get("when", lambda _a: True)(args):
+    needs_confirm = bool(rule and rule.get("when", lambda _a: True)(args))
+    guest = False
+    if speaker_verified is not None and fn_name not in GUEST_SAFE_TOOLS:
         try:
-            title, details = rule["describe"](args)
-        except Exception:
-            title, details = f"Run {fn_name}?", json.dumps(args, indent=2, default=str)
+            guest = not speaker_verified()
+        except Exception as e:
+            print(f"Speaker verification failed: {e}")
+            guest = True
+
+    if needs_confirm or guest:
+        if needs_confirm:
+            try:
+                title, details = rule["describe"](args)
+            except Exception:
+                title, details = f"Run {fn_name}?", json.dumps(args, indent=2, default=str)
+            tier = rule["tier"]
+        else:
+            title = f"Allow {fn_name.replace('_', ' ')}?"
+            details = json.dumps(args, indent=2, default=str) if args else ""
+            tier = TIER_CONFIRM
+        if guest:
+            title = "I don't recognise this voice. " + title
         request = {
             "id": os.urandom(8).hex(),
             "tool": fn_name,
-            "tier": rule["tier"],
+            "tier": tier,
             "title": title,
             "details": details,
+            "guest": guest,  # spoken "yes" doesn't count for an unrecognised voice
         }
         try:
             approved = bool(_confirm_handler(request))
@@ -3014,6 +3042,12 @@ def execute_tool(fn_map: dict, fn_name: str, raw_args) -> str:
             print(f"Confirmation handler failed: {e}")
             approved = False
         if not approved:
+            if guest:
+                return (
+                    "Declined: this voice wasn't recognised as the owner's and the owner didn't "
+                    "approve on screen. Nothing was done. Tell the speaker politely that you only "
+                    "take that kind of order from V."
+                )
             return f"The owner declined this action ({title}). Nothing was done."
 
     if _tool_listener:

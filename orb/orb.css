@@ -103,6 +103,13 @@ html, body {
   color: rgba(255, 241, 214, 0.85);
 }
 
+#confirm-hint {
+  font-size: 11px;
+  color: rgba(255, 241, 214, 0.6);
+  margin: -4px 0 8px;
+}
+#confirm-hint:empty { display: none; }
+
 #confirm-buttons { display: flex; gap: 10px; justify-content: center; }
 #confirm-buttons button {
   font-family: "Chakra Petch", sans-serif;

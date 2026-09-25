@@ -38,11 +38,12 @@ function startBackend() {
   const root = path.join(__dirname, '..');
   const exe = process.env.ORACLE_BACKEND;
   const cmd = exe || process.env.ORACLE_PYTHON || 'python';
-  const args = (exe ? [] : [path.join(root, 'oracle_server.py')]).concat('--exit-with-parent');
+  // The backend polls our PID and exits when we're gone, crash included.
+  const args = (exe ? [] : [path.join(root, 'oracle_server.py')]).concat('--parent-pid', String(process.pid));
 
   backend = spawn(cmd, args, {
     cwd: root,
-    stdio: ['pipe', 'pipe', 'pipe'], // the backend exits when our stdin end closes
+    stdio: ['ignore', 'pipe', 'pipe'],
     env: { ...process.env, PYTHONUNBUFFERED: '1', PYTHONIOENCODING: 'utf-8' },
     windowsHide: true,
   });
@@ -132,6 +133,7 @@ function refreshTray() {
   tray.setContextMenu(Menu.buildFromTemplate([
     { label: 'Talk to ORACLE', accelerator: TALK_HOTKEY, enabled: !muted, click: () => sendToBackend({ type: 'talk' }) },
     { label: 'Mute microphone', type: 'checkbox', checked: muted, accelerator: MUTE_HOTKEY, click: () => sendToBackend({ type: 'mute', value: !muted }) },
+    { label: 'Learn my voice…', enabled: !muted, click: () => sendToBackend({ type: 'enroll' }) },
     { type: 'separator' },
     { label: 'Quit ORACLE', click: () => app.quit() },
   ]));
@@ -180,8 +182,5 @@ app.on('window-all-closed', () => {});
 app.on('before-quit', () => {
   quitting = true;
   globalShortcut.unregisterAll();
-  if (backend && backend.exitCode === null) {
-    backend.stdin.end(); // lets --exit-with-parent shut the real interpreter down
-    backend.kill();
-  }
+  if (backend && backend.exitCode === null) backend.kill();
 });

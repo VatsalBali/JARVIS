@@ -13,6 +13,7 @@
   const confirmEl = document.getElementById('confirm');
   const confirmAction = document.getElementById('confirm-action');
   const confirmDetails = document.getElementById('confirm-details');
+  const confirmHint = document.getElementById('confirm-hint');
   const yesBtn = document.getElementById('confirm-yes');
   const noBtn = document.getElementById('confirm-no');
 
@@ -24,8 +25,7 @@
     thinking: 'THINKING', speaking: 'SPEAKING', followup: 'FOLLOW-UP',
   };
   const DEFAULT_TEXT = {
-    // No wake word yet: the hotkey or tray icon starts a turn.
-    asleep: 'Ctrl+Alt+Space to talk',
+    asleep: 'Ctrl+Alt+Space to talk', // replaced by the wake phrase on hello
     wake: 'Yes?',
     listening: '',
     thinking: '',
@@ -68,12 +68,12 @@
     }, 400);
   }
 
-  function setState(next) {
+  function setState(next, label) {
     if (!LABELS[next]) return;
     const prev = state;
     state = next;
     lens.setState(next);
-    labelEl.textContent = LABELS[next];
+    labelEl.textContent = label || LABELS[next];
     if (next === 'wake' || (next !== prev && DEFAULT_TEXT[next])) setText(DEFAULT_TEXT[next]);
     if (next === 'asleep') hideSoon();
     else show();
@@ -86,6 +86,7 @@
     confirmEl.classList.toggle('warn', msg.tier === 'warn');
     confirmAction.textContent = msg.action;
     confirmDetails.textContent = msg.details || '';
+    confirmHint.textContent = msg.spoken ? 'Say “yes” or “no”, or click.' : '';
     confirmEl.hidden = false;
     captionsEl.classList.add('confirming');
     show();
@@ -121,12 +122,13 @@
   function handle(msg) {
     switch (msg.type) {
       case 'hello':
-        console.log('backend says hello, state=' + msg.state);
+        console.log('backend says hello, state=' + msg.state + ', wake phrase=' + msg.wake_phrase);
+        if (msg.wake_phrase) DEFAULT_TEXT.asleep = `Say “${msg.wake_phrase}”`;
         setState(msg.state || 'asleep');
         bridge.reportMuted(!!msg.muted);
         break;
       case 'state':
-        setState(msg.state);
+        setState(msg.state, msg.label);
         break;
       case 'level':
         lens.setLevel(msg.value);

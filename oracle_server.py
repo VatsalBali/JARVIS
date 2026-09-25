@@ -11,14 +11,16 @@ to read:
     ORACLE_READY {"port": 51234, "token": "..."}
 
 Events to the UI:
-    {"type":"hello","state":"asleep","muted":false}
-    {"type":"state","state":"asleep|wake|listening|thinking|speaking|followup"}
+    {"type":"hello","state":"asleep","muted":false,"wake_phrase":"Hey Jarvis","voice_enrolled":false}
+    {"type":"state","state":"asleep|wake|listening|thinking|speaking|followup","label":"optional override"}
+    {"type":"speaker","verified":true,"enrolled":true,"score":0.83}
+    {"type":"enroll","ok":true}
     {"type":"level","value":0.0-1.0}
     {"type":"transcript","text":"...","final":false}
     {"type":"caption","text":"..."}
     {"type":"tool","name":"list_upcoming_events","label":"Checking your calendar…"}
-    {"type":"confirm","id":"...","action":"...","details":"...","tier":"confirm|warn"}
-    {"type":"confirm_closed","id":"...","ok":false,"reason":"timeout|cancel|answered"}
+    {"type":"confirm","id":"...","action":"...","details":"...","tier":"confirm|warn","spoken":true}
+    {"type":"confirm_closed","id":"...","ok":false,"reason":"timeout|cancel|answered|spoken"}
     {"type":"turn","user":"...","reply":"..."}          a finished voice turn
     {"type":"muted","value":true}
     {"type":"open_chat"}
@@ -29,7 +31,8 @@ Events from the UI:
     {"type":"cancel"}
     {"type":"open_chat"}
     {"type":"mute","value":true}
-    {"type":"talk"}                                      ring click / hotkey
+    {"type":"talk"}                                      hotkey / tray (same as the wake word)
+    {"type":"enroll"}                                    tray "Learn my voice"
     {"type":"call","id":"...","method":"send_message","args":{"text":"hi"}}
 
 Run standalone for testing:  python oracle_server.py [--port 8770]
@@ -42,6 +45,7 @@ import os
 import secrets
 import sys
 import threading
+import time
 from http import HTTPStatus
 from urllib.parse import urlparse, parse_qs
 
@@ -77,8 +81,9 @@ class Backend:
         self.muted = False
         self._pending = {}  # confirm id -> {"event": threading.Event, "ok": bool, "reason": str}
         self._pending_lock = threading.Lock()
-        self._voice_lock = threading.Lock()
         self._tasks = set()  # in-flight RPC tasks, kept so they aren't garbage-collected
+        self.voice = None    # VoiceEngine, started by start_voice()
+        self._enroll_after_conversation = False
 
         core.set_confirm_handler(self.confirm)
         core.set_tool_listener(lambda name, label: self.emit({"type": "tool", "name": name, "label": label}))
@@ -107,14 +112,25 @@ class Backend:
         slot = {"event": threading.Event(), "ok": False, "reason": "timeout"}
         with self._pending_lock:
             self._pending[request["id"]] = slot
+        spoken = bool(self.voice and self.voice.spoken_confirmation_allowed(request))
         self.emit({
             "type": "confirm",
             "id": request["id"],
             "action": request["title"],
             "details": request["details"],
             "tier": request["tier"],
+            "spoken": spoken,  # the orb hints "say yes or no"
         })
+        stop_listening = threading.Event()
+        if spoken:
+            # Whichever comes first, a click or a spoken yes/no, answers it.
+            threading.Thread(
+                target=self.voice.listen_yes_no,
+                args=(stop_listening, lambda ok: self._answer_confirm(request["id"], ok, "spoken")),
+                daemon=True,
+            ).start()
         slot["event"].wait(CONFIRM_TIMEOUT_SEC)
+        stop_listening.set()
         with self._pending_lock:
             self._pending.pop(request["id"], None)
         self.emit({"type": "confirm_closed", "id": request["id"], "ok": slot["ok"], "reason": slot["reason"]})
@@ -135,29 +151,56 @@ class Backend:
 
     # ---- voice ----
 
-    def start_voice_turn(self):
-        """One Gemini Live exchange on a worker thread. Ignored while muted
-        or while another turn is running."""
-        if self.muted or not self._voice_lock.acquire(blocking=False):
-            return
-        threading.Thread(target=self._voice_turn, daemon=True).start()
+    def _register_voice_tools(self):
+        """"Oracle, learn my voice" (README 4.3). Confirm tier, and a warning
+        when it would replace an existing voiceprint, so nobody else can
+        quietly enrol their own voice."""
+        def learn_owner_voice() -> str:
+            if self.voice is None:
+                return "Voice features aren't running."
+            self._enroll_after_conversation = True
+            self.voice.cancel()
+            return "Enrolment will start as soon as this conversation closes. Tell the owner to read the passage on screen."
 
-    def _voice_turn(self):
-        import gemini_voice  # imported lazily: it opens a Gemini client on import
-        try:
-            self.emit({"type": "state", "state": "wake"})
-            user_text, reply_text = gemini_voice.voice_turn_live(
-                self.session.history, self.session._ensure_conversation, on_event=self.emit
-            )
-            if user_text:
-                self.emit({"type": "turn", "user": user_text, "reply": reply_text})
-        except Exception as e:
-            print(f"Voice turn failed: {e}", file=sys.stderr)
-            self.emit({"type": "caption", "text": "My voice link is down at the moment."})
-        finally:
-            # No follow-up window yet (needs the persistent Live session).
-            self.emit({"type": "state", "state": "asleep"})
-            self._voice_lock.release()
+        core.AVAILABLE_FUNCTIONS["learn_owner_voice"] = learn_owner_voice
+        if not any(t["function"]["name"] == "learn_owner_voice" for t in core.TOOLS):
+            core.TOOLS.append({
+                "type": "function",
+                "function": {
+                    "name": "learn_owner_voice",
+                    "description": (
+                        "Record about half a minute of the owner's speech to learn their voice, "
+                        "so ORACLE can tell them apart from other people. Use when the owner says "
+                        "something like 'learn my voice'."
+                    ),
+                    "parameters": {"type": "object", "properties": {}},
+                },
+            })
+        core.TOOL_TIERS["learn_owner_voice"] = {
+            "tier": core.TIER_CONFIRM,
+            "describe": lambda _a: (
+                ("Replace the owner's saved voiceprint?", "Anyone who enrols here becomes the voice ORACLE obeys.")
+                if self.voice and self.voice.voice_id.enrolled
+                else ("Learn your voice now?", "You'll read a short passage aloud for about half a minute.")
+            ),
+        }
+        core.TOOL_LABELS["learn_owner_voice"] = "Getting ready to learn your voice…"
+
+    def _on_voice_state(self, event: dict):
+        """Runs deferred enrolment once a conversation has gone to sleep."""
+        if event.get("type") == "state" and event.get("state") == "asleep" and self._enroll_after_conversation:
+            self._enroll_after_conversation = False
+            threading.Timer(0.5, self.voice.start_enrollment).start()
+
+    def _emit_voice(self, event: dict):
+        self.emit(event)
+        self._on_voice_state(event)
+
+    def start_voice(self):
+        from voice_engine import VoiceEngine  # heavy imports: only when voice is used
+        self.voice = VoiceEngine(self._emit_voice, self.session)
+        self._register_voice_tools()
+        self.voice.start()
 
     # ---- socket ----
 
@@ -189,7 +232,13 @@ class Backend:
     async def _handler(self, ws):
         self.clients.add(ws)
         try:
-            await ws.send(json.dumps({"type": "hello", "state": self.state, "muted": self.muted}))
+            await ws.send(json.dumps({
+                "type": "hello",
+                "state": self.state,
+                "muted": self.muted,
+                "wake_phrase": self.voice.wake_phrase if self.voice else None,
+                "voice_enrolled": bool(self.voice and self.voice.voice_id.enrolled),
+            }))
             async for raw in ws:
                 try:
                     msg = json.loads(raw)
@@ -202,13 +251,22 @@ class Backend:
                     self._answer_confirm(str(msg.get("id")), bool(msg.get("ok")))
                 elif kind == "cancel":
                     self._cancel_all_confirms()
+                    if self.voice:
+                        self.voice.cancel()
                 elif kind == "open_chat":
                     self.emit({"type": "open_chat"})
                 elif kind == "mute":
                     self.muted = bool(msg.get("value"))
+                    if self.voice:
+                        await asyncio.to_thread(self.voice.set_muted, self.muted)
                     self.emit({"type": "muted", "value": self.muted})
                 elif kind == "talk":
-                    self.start_voice_turn()
+                    if self.voice:
+                        self.voice.trigger()
+                elif kind == "enroll":
+                    # From the tray: a click is the owner's authority.
+                    if self.voice:
+                        self.voice.start_enrollment()
                 elif kind == "call":
                     # Own task so a long send_message doesn't block
                     # confirm_reply messages arriving on this socket.
@@ -232,23 +290,30 @@ def main():
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     parser = argparse.ArgumentParser(description="ORACLE backend")
     parser.add_argument("--port", type=int, default=0, help="0 picks a free port")
+    parser.add_argument("--no-voice", action="store_true", help="don't open the microphone (testing)")
     parser.add_argument(
-        "--exit-with-parent", action="store_true",
-        help="exit when stdin closes, i.e. when the Electron parent quits or crashes",
+        "--parent-pid", type=int, default=0,
+        help="exit when this process (the Electron app) quits or crashes",
     )
     args = parser.parse_args()
 
-    if args.exit_with_parent:
+    if args.parent_pid:
         def watch_parent():
-            # Blocks until the parent's end of the pipe closes. Killing the
-            # parent's child handle isn't enough on Windows, where python.exe
+            # Polls rather than blocking on a stdin pipe: on Windows a pending
+            # synchronous read on stdin deadlocks later DLL loads (scipy, torch).
+            # Killing the child handle isn't enough either, since python.exe
             # can be a launcher stub with the real interpreter as its child.
-            sys.stdin.read()
+            import psutil
+            while psutil.pid_exists(args.parent_pid):
+                time.sleep(2)
             os._exit(0)
         threading.Thread(target=watch_parent, daemon=True).start()
 
+    backend = Backend(port=args.port)
+    if not args.no_voice:
+        backend.start_voice()
     try:
-        asyncio.run(Backend(port=args.port).run())
+        asyncio.run(backend.run())
     except KeyboardInterrupt:
         pass
 
