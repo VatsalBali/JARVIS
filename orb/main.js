@@ -1,0 +1,187 @@
+// ORACLE orb - Electron main process (README 4.3, "Orb window").
+//
+// Starts the Python backend (oracle_server.py) as a child process, reads its
+// ORACLE_READY line for the WebSocket port + per-launch token, and shows the
+// Golden Lens orb: a transparent, click-through, always-on-top window that
+// never takes focus. The renderer owns the WebSocket; this process handles
+// the window, tray and global hotkeys.
+//
+//   npm start                      dev: runs ../oracle_server.py with python
+//   ORACLE_BACKEND=<exe>           run a packaged backend exe instead
+//   ORACLE_PYTHON=<python.exe>     pick the Python interpreter
+//   ORACLE_ORB_ASLEEP=ember        show a faint ember when asleep instead of hiding
+
+const { app, BrowserWindow, Tray, Menu, ipcMain, globalShortcut, screen, nativeImage } = require('electron');
+const { spawn } = require('child_process');
+const path = require('path');
+const readline = require('readline');
+
+const ORB_W = 460;
+const ORB_H = 540;
+const HIDE_WHEN_ASLEEP = process.env.ORACLE_ORB_ASLEEP !== 'ember';
+// Ctrl+Space is VS Code's suggest shortcut, so the talk hotkey adds Alt.
+const TALK_HOTKEY = 'Control+Alt+Space';
+const MUTE_HOTKEY = 'Control+Alt+M';
+
+let backend = null;
+let backendInfo = null;
+let orb = null;
+let tray = null;
+let quitting = false;
+let muted = false;
+
+if (!app.requestSingleInstanceLock()) {
+  app.quit();
+}
+
+function startBackend() {
+  const root = path.join(__dirname, '..');
+  const exe = process.env.ORACLE_BACKEND;
+  const cmd = exe || process.env.ORACLE_PYTHON || 'python';
+  const args = (exe ? [] : [path.join(root, 'oracle_server.py')]).concat('--exit-with-parent');
+
+  backend = spawn(cmd, args, {
+    cwd: root,
+    stdio: ['pipe', 'pipe', 'pipe'], // the backend exits when our stdin end closes
+    env: { ...process.env, PYTHONUNBUFFERED: '1', PYTHONIOENCODING: 'utf-8' },
+    windowsHide: true,
+  });
+
+  return new Promise((resolve, reject) => {
+    readline.createInterface({ input: backend.stdout }).on('line', (line) => {
+      if (line.startsWith('ORACLE_READY ')) {
+        backendInfo = JSON.parse(line.slice('ORACLE_READY '.length));
+        resolve(backendInfo);
+      } else {
+        console.log('[backend]', line);
+      }
+    });
+    backend.stderr.on('data', (d) => process.stderr.write('[backend] ' + d));
+    backend.on('error', reject);
+    backend.on('exit', (code) => {
+      if (!backendInfo) {
+        reject(new Error(`backend exited with code ${code} before it was ready`));
+      } else if (!quitting) {
+        console.error(`backend exited with code ${code}; quitting`);
+        app.quit();
+      }
+    });
+  });
+}
+
+function createOrb() {
+  const { workArea } = screen.getPrimaryDisplay();
+  orb = new BrowserWindow({
+    width: ORB_W,
+    height: ORB_H,
+    x: Math.round(workArea.x + (workArea.width - ORB_W) / 2),
+    y: Math.round(workArea.y + (workArea.height - ORB_H) / 2),
+    transparent: true,
+    backgroundColor: '#00000000',
+    frame: false,
+    resizable: false,
+    movable: false,
+    minimizable: false,
+    maximizable: false,
+    alwaysOnTop: true,
+    skipTaskbar: true,
+    focusable: false, // never steals focus from what you're doing
+    hasShadow: false,
+    show: false,
+    webPreferences: {
+      preload: path.join(__dirname, 'preload.js'),
+      contextIsolation: true,
+      sandbox: true,
+      backgroundThrottling: false, // keep the socket responsive while hidden
+    },
+  });
+  orb.setAlwaysOnTop(true, 'screen-saver');
+  // Click-through everywhere except where the renderer says (Yes/No buttons).
+  orb.setIgnoreMouseEvents(true, { forward: true });
+  orb.webContents.on('console-message', (event) => console.log('[orb]', event.message));
+  orb.loadFile(path.join(__dirname, 'orb.html'));
+}
+
+function sendToBackend(msg) {
+  if (orb && !orb.isDestroyed()) orb.webContents.send('command', msg);
+}
+
+// A 32x32 ring drawn pixel by pixel: gold when the mic is live, grey when muted.
+function trayIcon() {
+  const size = 32;
+  const buf = Buffer.alloc(size * size * 4);
+  const [r, g, b] = muted ? [120, 110, 100] : [255, 184, 56];
+  for (let y = 0; y < size; y++) {
+    for (let x = 0; x < size; x++) {
+      const d = Math.hypot(x - 15.5, y - 15.5);
+      const ring = Math.max(0, 1 - Math.abs(d - 11.5) / 2.2);
+      const core = Math.max(0, 1 - Math.max(0, d - 3.5) / 1.2);
+      const a = Math.min(1, ring + core);
+      const i = (y * size + x) * 4;
+      // createFromBitmap expects BGRA on Windows.
+      buf[i] = b; buf[i + 1] = g; buf[i + 2] = r; buf[i + 3] = Math.round(a * 255);
+    }
+  }
+  return nativeImage.createFromBitmap(buf, { width: size, height: size });
+}
+
+function refreshTray() {
+  if (!tray) return;
+  tray.setImage(trayIcon());
+  tray.setToolTip(muted ? 'ORACLE - microphone muted' : 'ORACLE - listening for you');
+  tray.setContextMenu(Menu.buildFromTemplate([
+    { label: 'Talk to ORACLE', accelerator: TALK_HOTKEY, enabled: !muted, click: () => sendToBackend({ type: 'talk' }) },
+    { label: 'Mute microphone', type: 'checkbox', checked: muted, accelerator: MUTE_HOTKEY, click: () => sendToBackend({ type: 'mute', value: !muted }) },
+    { type: 'separator' },
+    { label: 'Quit ORACLE', click: () => app.quit() },
+  ]));
+}
+
+ipcMain.handle('backend-info', () => ({ ...backendInfo, hideWhenAsleep: HIDE_WHEN_ASLEEP }));
+
+ipcMain.on('orb-visible', (_e, visible) => {
+  if (!orb || orb.isDestroyed()) return;
+  if (visible && !orb.isVisible()) orb.showInactive();
+  else if (!visible && orb.isVisible()) orb.hide();
+});
+
+ipcMain.on('orb-mouse', (_e, interactive) => {
+  if (orb && !orb.isDestroyed()) orb.setIgnoreMouseEvents(!interactive, { forward: true });
+});
+
+ipcMain.on('orb-muted', (_e, value) => {
+  muted = !!value;
+  refreshTray();
+});
+
+app.whenReady().then(async () => {
+  try {
+    await startBackend();
+  } catch (e) {
+    console.error('Could not start the ORACLE backend:', e.message);
+    app.quit();
+    return;
+  }
+
+  if (app.isPackaged) app.setLoginItemSettings({ openAtLogin: true });
+
+  createOrb();
+  tray = new Tray(trayIcon());
+  tray.on('click', () => sendToBackend({ type: 'talk' }));
+  refreshTray();
+
+  globalShortcut.register(TALK_HOTKEY, () => sendToBackend({ type: 'talk' }));
+  globalShortcut.register(MUTE_HOTKEY, () => sendToBackend({ type: 'mute', value: !muted }));
+});
+
+// Closing the orb never quits ORACLE; Quit is in the tray.
+app.on('window-all-closed', () => {});
+
+app.on('before-quit', () => {
+  quitting = true;
+  globalShortcut.unregisterAll();
+  if (backend && backend.exitCode === null) {
+    backend.stdin.end(); // lets --exit-with-parent shut the real interpreter down
+    backend.kill();
+  }
+});

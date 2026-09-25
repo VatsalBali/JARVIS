@@ -1,0 +1,32 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta http-equiv="Content-Security-Policy"
+      content="default-src 'self'; connect-src ws://127.0.0.1:*; style-src 'self'; font-src 'self'; img-src 'self' data:">
+<title>ORACLE</title>
+<link rel="stylesheet" href="node_modules/@fontsource/chakra-petch/600.css">
+<link rel="stylesheet" href="node_modules/@fontsource/ibm-plex-mono/400.css">
+<link rel="stylesheet" href="orb.css">
+</head>
+<body>
+  <div id="stage">
+    <canvas id="lens"></canvas>
+    <div id="captions">
+      <div id="label">ASLEEP</div>
+      <div id="text"></div>
+      <div id="confirm" hidden>
+        <div id="confirm-action"></div>
+        <pre id="confirm-details"></pre>
+        <div id="confirm-buttons">
+          <button id="confirm-yes" type="button">Yes</button>
+          <button id="confirm-no" type="button">No</button>
+        </div>
+      </div>
+    </div>
+  </div>
+  <script src="lens.js"></script>
+  <script src="orb.js"></script>
+</body>
+</html>

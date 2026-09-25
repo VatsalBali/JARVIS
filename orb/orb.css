@@ -1,0 +1,121 @@
+/* Golden Lens palette (README 4.2). No blue anywhere. */
+:root {
+  --gold: #ffb838;
+  --amber: #ff8a1e;
+  --hot: #fff3d1;
+  --void: #130a03;
+  --ink: #fff1d6;
+}
+
+html, body {
+  margin: 0;
+  width: 100%;
+  height: 100%;
+  overflow: hidden;
+  background: transparent; /* the window is transparent over the desktop */
+  user-select: none;
+  cursor: default;
+}
+
+#stage {
+  position: relative;
+  width: 100%;
+  height: 100%;
+  opacity: 0;
+  transform: scale(0.94);
+  transition: opacity 320ms ease, transform 320ms ease;
+}
+#stage.visible { opacity: 1; transform: scale(1); }
+
+#lens {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+}
+
+#captions {
+  position: absolute;
+  left: 16px;
+  right: 16px;
+  bottom: 22px; /* grows upwards, so the Yes/No box always fits */
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 8px;
+  text-align: center;
+}
+
+#label {
+  font-family: "Chakra Petch", sans-serif;
+  font-weight: 600;
+  font-size: 13px;
+  letter-spacing: 6px;
+  color: var(--gold);
+  text-shadow: 0 0 8px rgba(0, 0, 0, 0.9);
+}
+
+#text {
+  font-family: "IBM Plex Mono", monospace;
+  font-size: 20px;
+  line-height: 1.35;
+  color: var(--ink);
+  text-shadow: 0 0 12px #000, 0 0 3px #000;
+  max-height: calc(20px * 1.35 * 3);
+  overflow: hidden;
+  overflow-wrap: anywhere;
+}
+
+#confirm {
+  margin-top: 4px;
+  width: 100%;
+  box-sizing: border-box;
+  padding: 10px 12px;
+  border: 1px solid rgba(255, 184, 56, 0.55);
+  border-radius: 8px;
+  background: rgba(19, 10, 3, 0.86);
+  font-family: "IBM Plex Mono", monospace;
+  color: var(--ink);
+}
+#confirm.warn { border-color: var(--amber); }
+#captions.confirming #text { display: none; }
+#confirm[hidden] { display: none; }
+
+#confirm-action {
+  font-family: "Chakra Petch", sans-serif;
+  font-weight: 600;
+  font-size: 13px;
+  color: var(--gold);
+  margin-bottom: 6px;
+}
+#confirm.warn #confirm-action { color: var(--amber); }
+
+#confirm-details {
+  margin: 0 0 10px;
+  font: inherit;
+  font-size: 11.5px;
+  line-height: 1.4;
+  text-align: left;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  max-height: calc(11.5px * 1.4 * 5);
+  overflow: hidden;
+  color: rgba(255, 241, 214, 0.85);
+}
+
+#confirm-buttons { display: flex; gap: 10px; justify-content: center; }
+#confirm-buttons button {
+  font-family: "Chakra Petch", sans-serif;
+  font-weight: 600;
+  font-size: 13px;
+  letter-spacing: 3px;
+  padding: 6px 22px;
+  border-radius: 5px;
+  cursor: pointer;
+  border: 1px solid var(--gold);
+  background: transparent;
+  color: var(--gold);
+}
+#confirm-buttons #confirm-yes { background: var(--gold); color: var(--void); }
+#confirm.warn #confirm-buttons #confirm-yes { background: var(--amber); border-color: var(--amber); }
+#confirm-buttons button:hover { filter: brightness(1.15); }

@@ -38,6 +38,7 @@ Run standalone for testing:  python oracle_server.py [--port 8770]
 import argparse
 import asyncio
 import json
+import os
 import secrets
 import sys
 import threading
@@ -231,7 +232,21 @@ def main():
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     parser = argparse.ArgumentParser(description="ORACLE backend")
     parser.add_argument("--port", type=int, default=0, help="0 picks a free port")
+    parser.add_argument(
+        "--exit-with-parent", action="store_true",
+        help="exit when stdin closes, i.e. when the Electron parent quits or crashes",
+    )
     args = parser.parse_args()
+
+    if args.exit_with_parent:
+        def watch_parent():
+            # Blocks until the parent's end of the pipe closes. Killing the
+            # parent's child handle isn't enough on Windows, where python.exe
+            # can be a launcher stub with the real interpreter as its child.
+            sys.stdin.read()
+            os._exit(0)
+        threading.Thread(target=watch_parent, daemon=True).start()
+
     try:
         asyncio.run(Backend(port=args.port).run())
     except KeyboardInterrupt:

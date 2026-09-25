@@ -10,3 +10,4 @@ open_javis.bat
 open_ps.bat
 dist/
 build/
+node_modules/
