@@ -36,6 +36,7 @@ live-capable model if this one starts erroring.
 """
 
 import asyncio
+import os
 import numpy as np
 import sounddevice as sd
 from google import genai
@@ -43,7 +44,10 @@ from google.genai import types
 
 import core  # reuse TOOLS, AVAILABLE_FUNCTIONS, SYSTEM_PROMPT, save_message
 
-MODEL = "gemini-live-2.5-flash-preview-native-audio-09-2025"
+# Preview ids rotate, so this is config, not code (README 4.3): set
+# ORACLE_GEMINI_LIVE_MODEL to override without editing this file.
+DEFAULT_MODEL = "gemini-live-2.5-flash-preview-native-audio-09-2025"
+MODEL = os.environ.get("ORACLE_GEMINI_LIVE_MODEL") or DEFAULT_MODEL
 
 INPUT_RATE = 16000    # what we send the mic at
 OUTPUT_RATE = 24000    # what Gemini's audio replies come back at
@@ -85,17 +89,44 @@ def _live_config() -> dict:
     }
 
 
-async def _run_turn(on_status=None) -> tuple:
+def _level(samples: np.ndarray) -> float:
+    """0-1 loudness of an int16 chunk, scaled so normal speech lands
+    around 0.3-0.8 - drives the orb's core pulse."""
+    if samples.size == 0:
+        return 0.0
+    rms = float(np.sqrt(np.mean((samples.astype(np.float32) / 32768.0) ** 2)))
+    return min(1.0, rms * 6.0)
+
+
+async def _run_turn(on_status=None, on_event=None) -> tuple:
     """
     One full exchange over a fresh Live session: streams mic audio in,
     plays audio replies as they arrive, dispatches any tool calls via
-    core.AVAILABLE_FUNCTIONS, and returns (user_text, reply_text) - the
+    core.execute_tool, and returns (user_text, reply_text) - the
     transcripts of what was said on each side, for the caller to save
     and display. Ends when Gemini signals turn_complete.
+
+    on_event(dict), if given, receives the orb events from README 4.3:
+    state (listening/thinking/speaking), level, transcript and caption.
     """
     user_text_parts = []
     reply_text_parts = []
     stop_sending = asyncio.Event()
+    state = {"current": None}
+
+    def emit(event: dict):
+        if on_event:
+            try:
+                on_event(event)
+            except Exception as e:
+                print(f"on_event failed: {e}")
+
+    def set_state(new_state: str):
+        if state["current"] != new_state:
+            state["current"] = new_state
+            emit({"type": "state", "state": new_state})
+
+    set_state("listening")
 
     async with _client.aio.live.connect(model=MODEL, config=_live_config()) as session:
 
@@ -105,6 +136,8 @@ async def _run_turn(on_status=None) -> tuple:
             try:
                 while not stop_sending.is_set():
                     data, _ = await asyncio.to_thread(stream.read, CHUNK_SAMPLES)
+                    if state["current"] == "listening":
+                        emit({"type": "level", "value": _level(data)})
                     await session.send_realtime_input(
                         audio=types.Blob(
                             data=data.tobytes(),
@@ -125,8 +158,10 @@ async def _run_turn(on_status=None) -> tuple:
                 if response.data is not None:
                     if on_status:
                         on_status("SPEAKING...")
+                    set_state("speaking")
                     audio = np.frombuffer(response.data, dtype=np.int16)
-                    out_stream.write(audio)
+                    emit({"type": "level", "value": _level(audio)})
+                    await asyncio.to_thread(out_stream.write, audio)
 
                 elif response.tool_call:
                     # Pause the mic while tools run and the model
@@ -135,6 +170,7 @@ async def _run_turn(on_status=None) -> tuple:
                     stop_sending.set()
                     if on_status:
                         on_status("THINKING...")
+                    set_state("thinking")
 
                     function_responses = []
                     for fc in response.tool_call.function_calls:
@@ -157,10 +193,13 @@ async def _run_turn(on_status=None) -> tuple:
                     sc = response.server_content
                     if sc.input_transcription and sc.input_transcription.text:
                         user_text_parts.append(sc.input_transcription.text)
+                        emit({"type": "transcript", "text": "".join(user_text_parts).strip(), "final": False})
                     if sc.output_transcription and sc.output_transcription.text:
                         reply_text_parts.append(sc.output_transcription.text)
+                        emit({"type": "caption", "text": "".join(reply_text_parts).strip()})
                     if sc.turn_complete:
                         stop_sending.set()
+                        emit({"type": "transcript", "text": "".join(user_text_parts).strip(), "final": True})
                         break
         finally:
             stop_sending.set()
@@ -171,7 +210,7 @@ async def _run_turn(on_status=None) -> tuple:
     return "".join(user_text_parts).strip(), "".join(reply_text_parts).strip()
 
 
-def voice_turn_live(history: list, ensure_conversation, on_status=None) -> tuple:
+def voice_turn_live(history: list, ensure_conversation, on_status=None, on_event=None) -> tuple:
     """
     Synchronous entry point for UI.py's threaded ring-click flow - same
     role as core.listen_and_transcribe()+run_conversation()+speak()
@@ -186,7 +225,7 @@ def voice_turn_live(history: list, ensure_conversation, on_status=None) -> tuple
     Returns (user_text, reply_text) so the caller can update the ring
     status / chat log the same way it already does for the Groq path.
     """
-    user_text, reply_text = asyncio.run(_run_turn(on_status=on_status))
+    user_text, reply_text = asyncio.run(_run_turn(on_status=on_status, on_event=on_event))
 
     if not user_text:
         return user_text, reply_text

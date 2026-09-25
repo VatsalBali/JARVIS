@@ -2925,6 +2925,47 @@ def _terminal_confirm(request: dict) -> bool:
 _confirm_handler = _terminal_confirm
 
 
+# Captions shown under the orb while a tool runs (README 4.1, Thinking).
+TOOL_LABELS = {
+    "get_current_time": "Checking the time…",
+    "list_files": "Looking through your files…",
+    "open_file": "Opening that file…",
+    "launch_app": "Launching it…",
+    "read_file": "Reading the file…",
+    "move_file": "Moving the file…",
+    "delete_file": "Sending it to the Recycle Bin…",
+    "create_file": "Creating the file…",
+    "get_system_info": "Running diagnostics…",
+    "ask_coding_agent": "Consulting the workshop…",
+    "web_search": "Searching the web…",
+    "open_web_search": "Opening a search…",
+    "open_url": "Opening the page…",
+    "send_notification": "Sending a notification…",
+    "list_recent_emails": "Checking your inbox…",
+    "read_email": "Reading the email…",
+    "send_email": "Sending the email…",
+    "delete_email": "Deleting the email…",
+    "list_upcoming_events": "Checking your calendar…",
+    "create_calendar_event": "Adding it to your calendar…",
+    "delete_calendar_event": "Removing the event…",
+    "list_gmail_messages": "Checking Gmail…",
+    "read_gmail_message": "Reading the email…",
+    "send_gmail_message": "Sending the email…",
+    "delete_gmail_message": "Trashing the email…",
+    "run_shell_command": "Running the command…",
+    "run_sql_query": "Querying the database…",
+}
+
+_tool_listener = None
+
+
+def set_tool_listener(listener):
+    """listener(name: str, label: str) is called just before each tool runs
+    (after any confirmation), so a UI can caption what ORACLE is doing."""
+    global _tool_listener
+    _tool_listener = listener
+
+
 def set_confirm_handler(handler):
     """UI.py registers a handler that shows Yes/No in the window and blocks
     until the owner answers. handler(request: dict) -> bool, where request
@@ -2974,6 +3015,12 @@ def execute_tool(fn_map: dict, fn_name: str, raw_args) -> str:
             approved = False
         if not approved:
             return f"The owner declined this action ({title}). Nothing was done."
+
+    if _tool_listener:
+        try:
+            _tool_listener(fn_name, TOOL_LABELS.get(fn_name, "Working on it…"))
+        except Exception as e:
+            print(f"Tool listener failed: {e}")
 
     try:
         return str(fn(**args))
