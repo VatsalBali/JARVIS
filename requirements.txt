@@ -27,6 +27,14 @@ librosa
 pycaw              # ducks other apps' volume while ORACLE listens/speaks; set_volume
 yt-dlp             # play_music: finds the YouTube video for a song, no API key
 
+# Messaging (messaging.py): WhatsApp Desktop via UI automation, incoming
+# messages from Windows notifications
+pywinauto
+winrt-Windows.UI.Notifications.Management
+winrt-Windows.UI.Notifications
+winrt-Windows.Foundation.Collections
+winrt-Windows.ApplicationModel
+
 # piper-tts removed: was only used by core.speak(), which the ring-click
 # flow no longer calls (see gemini_voice.py). faster-whisper/sounddevice
 # stay - still used by core.listen_and_transcribe() for the mic-dictate
@@ -35,8 +43,4 @@ yt-dlp             # play_music: finds the YouTube video for a song, no API key
 
 # Only needed to build the standalone .exe (via build.bat) - not required
 # to just run `python ui.py` during development.
-pyinstallerpywinauto
-winrt-Windows.UI.Notifications.Management
-winrt-Windows.UI.Notifications
-winrt-Windows.Foundation.Collections
-winrt-Windows.ApplicationModel
+pyinstaller
