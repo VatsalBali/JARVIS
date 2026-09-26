@@ -97,7 +97,7 @@ def _to_gemini_tools() -> list:
     tool's description/parameters still only needs to be written once,
     in core.py, and both voice backends stay in sync automatically."""
     declarations = []
-    for t in core.TOOLS:
+    for t in core.active_tools():
         fn = t["function"]
         declarations.append({
             "name": fn["name"],

@@ -53,7 +53,7 @@ LOCAL_VAD_FLOOR = 0.004           # speech if frame RMS > max(0.01, 3x this)
 GATE_HANGOVER_SEC = 0.6           # after speech stops, send silence instead of room noise
 SPEECH_PROB = 0.5                 # Silero VAD speech probability threshold
 SPEECH_RMS_FLOOR = 0.006          # ...and at least this loud (drops very distant voices)
-FOLLOWUP_MAX_SEC = 15.0           # speech can stretch the follow-up window, but no further
+ANSWER_WAIT_SEC = 8.0             # after ORACLE asks a question, how long it waits for an answer to start
 LISTEN_MAX_SEC = 45.0             # one request can't hold the mic open longer than this
 FOLLOWUP_SEC = 6.0                # suggested value for the followup_seconds setting (default 0: off)
 STOP_DEBOUNCE_SEC = 0.7
@@ -77,7 +77,9 @@ ENROL_PASSAGE = (
 
 VOICE_STYLE = (
     " You are speaking aloud through the orb, so keep replies brief and "
-    "conversational, with no markdown, lists or links."
+    "conversational, with no markdown, lists or links. If you need details to do "
+    "something (an email's subject and message, a reminder's time), ask for them in "
+    "one short question and wait for the answer; never make them up."
 )
 
 
@@ -529,6 +531,7 @@ class Conversation:
         self.followup_sec = float(core.get_setting("followup_seconds") or 0)
         self.drain_done_at = 0.0
         self.awaiting_answer = False  # tool result sent, spoken answer not yet received
+        self.asked_question = False   # the last reply ended with a question for the owner
         self.last_transcript_at = 0.0
         self.is_speech = SpeechDetector()
         self.user_parts = []
@@ -696,6 +699,9 @@ class Conversation:
         self.user_parts, self.reply_parts = [], []
         self.turn_audio = []
         self._verified = None
+        # Did ORACLE end on a question ("What should the subject be, Sir?")?
+        # Then it waits for the answer instead of going back to sleep.
+        self.asked_question = reply_text.rstrip(" \"'”’").endswith("?")
         if user_text:
             self.emit({"type": "transcript", "text": user_text, "final": True})
             self.engine.save_turn(user_text, reply_text)
@@ -719,13 +725,13 @@ class Conversation:
                 if voiced:
                     self.voiced_audio.append(frame)
                     self.last_voice_at = time.monotonic()
-                    if self.mode == "listening":
-                        self.heard_speech = True
-                    else:
-                        self.followup_until = min(
-                            max(self.followup_until, self.last_voice_at + 2.0),
-                            self.followup_started + FOLLOWUP_MAX_SEC,
-                        )
+                    if self.mode == "followup":
+                        # The owner has started answering: from here it's a
+                        # normal request, with the listening limits (a long
+                        # dictated email isn't cut off at the follow-up cap).
+                        self.listen_started = self.last_voice_at
+                        self._set_mode("listening")
+                    self.heard_speech = True
                 if self.mode == "listening":
                     self.emit({"type": "level", "value": _level(frame)})
             if self.sending:
@@ -759,9 +765,11 @@ class Conversation:
             elif (self.mode == "thinking" and not self.tool_running
                     and now - self.last_server_at > NO_REPLY_SEC):
                 self._end()  # waiting on an answer that never came
-            elif self.mode == "draining" and not self.player.busy and self.followup_sec <= 0:
+            elif (self.mode == "draining" and not self.player.busy
+                    and self.followup_sec <= 0 and not self.asked_question):
                 # One command per wake (the owner's choice): once the reply
-                # has left the device buffer, go back to sleep.
+                # has left the device buffer, go back to sleep - unless it
+                # asked a question, which opens the follow-up window below.
                 self._show_captions(everything=True)
                 if not self.drain_done_at:
                     self.drain_done_at = now
@@ -775,7 +783,11 @@ class Conversation:
                 self.turn_audio = []
                 self.heard_speech = False
                 self.followup_started = now
-                self.followup_until = now + self.followup_sec
+                wait = max(self.followup_sec, ANSWER_WAIT_SEC if self.asked_question else 0)
+                self.followup_until = now + wait
+                if self.asked_question:
+                    self._event("awaiting_answer")
+                self.asked_question = False
                 self._set_mode("followup")
                 self.engine.ducker.restore()
             elif self.mode == "followup" and not self.heard_speech and now > self.followup_until:

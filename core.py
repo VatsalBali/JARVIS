@@ -3502,6 +3502,22 @@ AVAILABLE_FUNCTIONS = {
 
 
 # ---------------------------------------------------------------------------
+# Tools whose service isn't set up are hidden from the model, so it doesn't
+# pick one that can only fail (e.g. Outlook's send_email when the owner's
+# mail is Gmail) - it uses the working alternative instead.
+OUTLOOK_TOOLS = {"list_recent_emails", "read_email", "send_email", "delete_email",
+                 "list_upcoming_events", "create_calendar_event", "delete_calendar_event"}
+
+
+def active_tools() -> list:
+    hidden = set()
+    if not os.environ.get("MS_CLIENT_ID"):
+        hidden |= OUTLOOK_TOOLS
+    if not os.environ.get("TAVILY_API_KEY"):
+        hidden.add("web_search")  # open_web_search still works
+    return [t for t in TOOLS if t["function"]["name"] not in hidden]
+
+
 # CODING-ONLY TOOLS: schema entries for the Coding agent expansion
 # (run_shell_command, run_sql_query, list_tracked_projects, bug tracker -
 # implementations are defined earlier, right after run_coding_conversation).
@@ -4018,7 +4034,7 @@ def run_conversation(user_input: str, history: list, conversation_id: int = None
         response = client.chat.completions.create(
             model=MODEL,
             messages=history,
-            tools=TOOLS,
+            tools=active_tools(),
         )
 
         message = response.choices[0].message
