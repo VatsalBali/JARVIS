@@ -525,6 +525,8 @@ class Conversation:
         self.voiced_audio = deque(maxlen=12 * FRAMES_PER_SEC)  # speech only, for voice ID
         self._verified = None         # cached per turn
         self.player = None
+        self.ack_pending = None       # "Yes, Sir?" clip waiting to see if the owner pauses
+        self.ack_until = 0.0          # mic muted to Gemini until the wake acknowledgement has played
         # Diagnostics, written to voice_sessions.log when the conversation ends.
         self.t0 = time.monotonic()
         self.stats = {"audio_bytes": 0, "gated_frames": 0}
@@ -608,6 +610,36 @@ class Conversation:
         if text:
             self.emit({"type": "caption", "text": text})
 
+    async def _ack_after_pause(self):
+        """"Yes, Sir?" once the owner has paused after the wake word; nothing
+        if they're already giving the command. Runs while Gemini connects.
+        The mic is muted to Gemini while it plays (plus the device delay), so
+        on speakers ORACLE doesn't hear itself and take it as the request. On
+        headphones nothing leaks, so the owner can talk over it."""
+        ack, self.ack_pending = self.ack_pending, None
+        if not ack:
+            return
+        await asyncio.sleep(ACK_WAIT_SEC)
+        recent = self.engine.mic.recent(ACK_WAIT_SEC)
+
+        def talking() -> bool:
+            detect = SpeechDetector()
+            return any([detect(f) for f in _frames(recent)])
+
+        if await asyncio.to_thread(talking) or self.mode != "listening" or self.heard_speech:
+            self._event("ack_skipped")  # already talking: don't talk over the command
+            return
+        lead_in = bytes(int(OUTPUT_RATE * ACK_LEAD_IN_SEC) * 2)
+        self.player.write(lead_in + ack)
+        self.player.end_turn()
+        self.skipped_bytes -= len(lead_in + ack)  # captions follow the reply's audio, not this
+        speakers = not await asyncio.to_thread(_output_is_headphones)
+        if speakers:
+            self.ack_until = (time.monotonic() + ACK_LEAD_IN_SEC + len(ack) / (OUTPUT_RATE * 2)
+                              + PREBUFFER_SEC + OUTPUT_LATENCY + 0.15)
+        self.listen_started = time.monotonic()  # the no-speech timeout starts after it
+        self._event("ack" + ("_muting_mic" if speakers else ""))
+
     def _start_listening(self):
         self.sending = True
         self.heard_speech = False
@@ -660,6 +692,8 @@ class Conversation:
                 frame = await asyncio.to_thread(self.mic_q.get, True, 0.2)
             except queue.Empty:
                 continue
+            if time.monotonic() < self.ack_until:
+                frame = np.zeros_like(frame)  # our own "Yes, Sir?" coming back through the mic
             voiced = self.is_speech(frame)
             if self.mode in ("listening", "followup"):
                 self.turn_audio.append(frame)
@@ -853,6 +887,8 @@ class Conversation:
         self.loop = asyncio.get_running_loop()
         self.done = asyncio.Event()
         self.player = Player()
+        self.ack_pending = self.engine.acks.pick()
+        ack_task = asyncio.create_task(self._guard(self._ack_after_pause()))
         # The date and time let "remind me at 6" / "tomorrow" resolve without
         # an extra get_current_time round trip.
         config = gemini_voice._live_config(
@@ -870,9 +906,9 @@ class Conversation:
                     asyncio.create_task(self._guard(self._watchdog())),
                 ]
                 await self.done.wait()
-                for t in tasks:
+                for t in tasks + [ack_task]:
                     t.cancel()
-                await asyncio.gather(*tasks, return_exceptions=True)
+                await asyncio.gather(*tasks, ack_task, return_exceptions=True)
         finally:
             self._finish_turn(final=True)
             self.engine.mic.unsubscribe(self.mic_q)
@@ -891,6 +927,86 @@ def _chime() -> bytes:
         out.append(np.sin(2 * np.pi * freq * t) * env * 9000)
     out.append(np.zeros(int(OUTPUT_RATE * 0.15)))
     return np.concatenate(out).astype(np.int16).tobytes()
+
+
+# ---------------------------------------------------------------------------
+# Wake acknowledgement ("Yes, Sir?")
+# ---------------------------------------------------------------------------
+
+ACK_PHRASES = ["Yes, Sir?", "Sir?", "At your service.", "I'm listening.", "How can I help?"]
+ACK_LEAD_IN_SEC = 0.25   # silence first, so Bluetooth headphones waking up don't clip it
+ACK_WAIT_SEC = 0.35      # speech within this long after the wake word: no ack, it's the command
+
+
+def _output_is_headphones() -> bool:
+    """Headphones can't leak ORACLE's voice back into the mic, so the mic
+    needn't be muted while it speaks. Windows names these endpoints
+    "Headphones (...)" / "Headset (...)"; anything else is treated as speakers."""
+    try:
+        name = sd.query_devices(kind="output")["name"].lower()
+    except Exception:
+        return False
+    return any(w in name for w in ("headphone", "headset", "earbud", "earphone", "airpods", "buds"))
+
+
+def _trim_silence(pcm: bytes, threshold: int = 300) -> bytes:
+    a = np.frombuffer(pcm, dtype=np.int16)
+    loud = np.flatnonzero(np.abs(a) > threshold)
+    if not loud.size:
+        return b""
+    pad = int(OUTPUT_RATE * 0.03)
+    return a[max(0, loud[0] - pad): loud[-1] + pad].tobytes()
+
+
+class Acks:
+    """Short spoken acknowledgements played the moment the wake word is heard.
+    Generated once in ORACLE's current voice and cached on disk, so playing
+    one costs no network round trip."""
+
+    def __init__(self):
+        self._clips = []
+        self._lock = threading.Lock()
+
+    def _folder(self) -> str:
+        voice, _ = gemini_voice.voice_settings()
+        accent = core.get_setting("voice_accent") or "none"
+        return os.path.join(_data_dir(), "acks", re.sub(r"[^\w-]", "_", f"{voice or 'default'}_{accent}"))
+
+    def prepare(self):
+        """Loads cached clips and generates any missing ones (background thread)."""
+        folder = self._folder()
+        os.makedirs(folder, exist_ok=True)
+        owner = getattr(core, "OWNER_NAME", "Sir")
+        for i, phrase in enumerate(ACK_PHRASES):
+            text = phrase.format(owner=owner)
+            path = os.path.join(folder, f"{i}_{re.sub(r'[^A-Za-z]', '', text)}.pcm")
+            pcm = b""
+            if os.path.exists(path):
+                with open(path, "rb") as f:
+                    pcm = f.read()
+            else:
+                try:
+                    pcm = _trim_silence(asyncio.run(asyncio.wait_for(_speak(text), timeout=20))[0])
+                except Exception as e:
+                    print(f"Couldn't prepare the wake acknowledgement {text!r}: {e}")
+                    continue
+                # A misread comes back long; a real ack is well under 2 seconds.
+                if not pcm or len(pcm) > 2.5 * OUTPUT_RATE * 2:
+                    continue
+                with open(path, "wb") as f:
+                    f.write(pcm)
+            if pcm:
+                with self._lock:
+                    self._clips.append(pcm)
+
+    def pick(self):
+        if (core.get_setting("wake_ack") or "on") == "off":
+            return None
+        with self._lock:
+            if not self._clips:
+                return None
+            import random
+            return random.choice(self._clips)
 
 
 BRIEFING_STYLE = (
@@ -949,6 +1065,8 @@ class VoiceEngine:
         self.voice_id = VoiceID()
         self.ducker = Ducker()
         self.wake = WakeWord(self.mic, self._wake_should_listen, self._on_wake)
+        self.acks = Acks()
+        self._acks_started = False
         self.muted = False
         self.conversation = None
         self._busy = threading.Lock()   # one conversation or enrolment at a time
@@ -960,6 +1078,9 @@ class VoiceEngine:
         return self.wake.phrase
 
     def start(self):
+        if not self._acks_started:
+            self._acks_started = True
+            threading.Thread(target=self.acks.prepare, daemon=True, name="acks").start()
         try:
             self.mic.start()
             self.wake.start()
