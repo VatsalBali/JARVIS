@@ -141,7 +141,7 @@
     switch (msg.type) {
       case 'hello':
         console.log('backend says hello, state=' + msg.state + ', wake phrase=' + msg.wake_phrase);
-        if (msg.wake_phrase) DEFAULT_TEXT.asleep = `Say “${msg.wake_phrase}”`;
+        if (msg.wake_phrase) DEFAULT_TEXT.asleep = `Say “${msg.wake_phrase}” or press Ctrl+Alt+O`;
         setState(msg.state || 'asleep');
         bridge.reportMuted(!!msg.muted);
         if (!greeted && state === 'asleep') {

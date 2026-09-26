@@ -17,7 +17,8 @@
 
   // State table from the mockup (durations in seconds).
   const STATES = {
-    asleep:    { ringOp: 0.1,  sparkOp: 0,   circuitOp: 0.04, glowOp: 0.12, coreScale: 0.45, pulse: 1.02, pulseDur: 4,    durA: 90, durB: 70, durC: 60, follows: false },
+    // Brighter than the mockup's ember: the orb now stays on screen while asleep.
+    asleep:    { ringOp: 0.4,  sparkOp: 0,   circuitOp: 0.15, glowOp: 0.35, coreScale: 0.7, pulse: 1.02, pulseDur: 4,    durA: 90, durB: 70, durC: 60, follows: false },
     wake:      { ringOp: 1,    sparkOp: 1,   circuitOp: 0.9,  glowOp: 1,    coreScale: 1.1,  pulse: 1.08, pulseDur: 1.2,  durA: 40, durB: 30, durC: 20, follows: false },
     listening: { ringOp: 0.85, sparkOp: 0.7, circuitOp: 0.6,  glowOp: 0.8,  coreScale: 1,    pulse: 1.12, pulseDur: 0.7,  durA: 60, durB: 45, durC: 30, follows: true },
     thinking:  { ringOp: 0.75, sparkOp: 0.5, circuitOp: 1,    glowOp: 0.6,  coreScale: 0.9,  pulse: 1.03, pulseDur: 1.6,  durA: 8,  durB: 6,  durC: 3,  follows: false },

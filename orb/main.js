@@ -9,7 +9,7 @@
 //   npm start                      dev: runs ../oracle_server.py with python
 //   ORACLE_BACKEND=<exe>           run a packaged backend exe instead
 //   ORACLE_PYTHON=<python.exe>     pick the Python interpreter
-//   ORACLE_ORB_ASLEEP=ember        show a faint ember when asleep instead of hiding
+//   ORACLE_ORB_ASLEEP=hide         hide the orb while asleep (default: it stays on screen)
 
 const { app, BrowserWindow, Tray, Menu, ipcMain, globalShortcut, screen, nativeImage } = require('electron');
 const { spawn } = require('child_process');
@@ -18,7 +18,9 @@ const readline = require('readline');
 
 const ORB_W = 460;
 const ORB_H = 540;
-const HIDE_WHEN_ASLEEP = process.env.ORACLE_ORB_ASLEEP !== 'ember';
+// The orb stays on screen (behind other windows) between commands, dimmed
+// to an ember while asleep - the owner's choice.
+const HIDE_WHEN_ASLEEP = process.env.ORACLE_ORB_ASLEEP === 'hide';
 // Ctrl+Space is VS Code's suggest shortcut, so the talk hotkeys add Alt.
 // Ctrl+Alt+O is also the Start-menu shortcut's hotkey (install_shortcut.ps1):
 // it starts ORACLE when it isn't running, and talks when it is.
