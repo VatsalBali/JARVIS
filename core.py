@@ -2933,7 +2933,7 @@ TOOLS = [
             "name": "close_app",
             "description": (
                 "Close an application's windows, like clicking its X, so it can still ask to save work "
-                "(e.g. 'chrome', 'word', 'spotify', 'file explorer'). The owner is asked to confirm. "
+                "(e.g. 'chrome', 'word', 'spotify', 'file explorer'). Just do it when asked; no need to check first. "
                 "Set force=true ONLY when the owner explicitly asks to force-quit or kill an app, or it "
                 "didn't close and they want it gone - force-quitting loses unsaved work. If unsure what "
                 "the app is called, call list_open_apps first."
@@ -3781,8 +3781,11 @@ TOOL_TIERS = {
         "describe": lambda a: ("Delete this calendar event? This can't be undone.", _calendar_event_summary(a.get("event_id", ""))),
     },
     "close_app": {
-        # A normal close lets the app ask to save; force-quit loses work.
-        "tier": lambda a: TIER_WARN if a.get("force") else TIER_CONFIRM,
+        # A normal close runs straight away (the owner's choice): it's what
+        # the X button does, so the app still asks to save. Force-quit
+        # loses unsaved work and always warns.
+        "tier": TIER_WARN,
+        "when": lambda a: bool(a.get("force")),
         "describe": _describe_close,
     },
     "run_shell_command": {
