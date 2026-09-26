@@ -37,6 +37,7 @@ import psutil
 import sounddevice as sd
 import numpy as np
 import threading
+import contextlib
 import re
 from pathlib import Path
 from datetime import datetime, timedelta
@@ -1705,6 +1706,165 @@ def get_weather(location: str = "", days: int = 1) -> str:
 
 
 # ---------------------------------------------------------------------------
+# MORNING BRIEFING (README 3.1): time, weather, today's calendar, unread
+# mail, system health, reminders and top news. Sections are gathered in
+# parallel; any that fail or aren't set up are reported, not fatal. Sign-ins
+# never pop up (it may run unattended). Mail content is data: only senders
+# and subjects are included.
+# ---------------------------------------------------------------------------
+
+DEFAULT_NEWS_FEEDS = [
+    "https://feeds.bbci.co.uk/news/world/rss.xml",
+    "https://news.google.com/rss?hl=en-CZ&gl=CZ&ceid=CZ:en",
+]
+BRIEFING_SECTION_TIMEOUT = 10
+
+
+def _brief_calendar() -> str:
+    from datetime import timezone
+    start = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0).astimezone()
+    # UTC with Z: a "+02:00" offset in a query string would decode as a space.
+    z = lambda d: d.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    resp = _graph_request(
+        "GET",
+        f"/me/calendarView?startDateTime={z(start)}&endDateTime={z(start + timedelta(days=1))}"
+        f"&$select=subject,start,end,location&$orderby=start/dateTime&$top=20",
+    )
+    resp.raise_for_status()
+    events = resp.json().get("value", [])
+    if not events:
+        return "Calendar: nothing scheduled today."
+    lines = []
+    for e in events:
+        # Graph returns UTC unless asked otherwise; show local time.
+        t = datetime.fromisoformat(e["start"]["dateTime"][:19]).replace(tzinfo=timezone.utc).astimezone()
+        loc = e.get("location", {}).get("displayName")
+        lines.append(f"- {t:%H:%M} {e.get('subject', '(no subject)')}" + (f" ({loc})" if loc else ""))
+    return "Calendar today:\n" + "\n".join(lines)
+
+
+def _brief_outlook_mail() -> str:
+    count = _graph_request("GET", "/me/mailFolders/inbox?$select=unreadItemCount")
+    count.raise_for_status()
+    n = count.json().get("unreadItemCount", 0)
+    if not n:
+        return "Outlook: no unread mail."
+    top = _graph_request("GET", "/me/mailFolders/inbox/messages?$filter=isRead eq false&$top=3&$select=subject,from")
+    top.raise_for_status()
+    items = [f"- {m.get('from', {}).get('emailAddress', {}).get('name', '?')}: {m.get('subject', '(no subject)')}"
+             for m in top.json().get("value", [])]
+    return f"Outlook: {n} unread. Latest:\n" + "\n".join(items)
+
+
+def _brief_gmail() -> str:
+    label = _gmail_request("GET", "/users/me/labels/INBOX")
+    label.raise_for_status()
+    n = label.json().get("messagesUnread", 0)
+    if not n:
+        return "Gmail: no unread mail."
+    listing = _gmail_request("GET", "/users/me/messages", params={"q": "is:unread in:inbox", "maxResults": 3})
+    listing.raise_for_status()
+    items = []
+    for m in listing.json().get("messages", []):
+        meta = _gmail_request("GET", f"/users/me/messages/{m['id']}",
+                              params={"format": "metadata", "metadataHeaders": ["From", "Subject"]})
+        headers = {h["name"]: h["value"] for h in meta.json().get("payload", {}).get("headers", [])}
+        sender = re.sub(r"\s*<[^>]+>", "", headers.get("From", "?")).strip('" ')
+        items.append(f"- {sender}: {headers.get('Subject', '(no subject)')}")
+    return f"Gmail: {n} unread. Latest:\n" + "\n".join(items)
+
+
+def _brief_system() -> str:
+    s = get_system_stats_dict()
+    text = f"System: CPU {s.get('cpu_percent')}%, RAM {s.get('ram_percent')}%, disk {s.get('disk_percent')}% full"
+    battery = psutil.sensors_battery()
+    if battery:
+        text += f", battery {battery.percent:.0f}%" + (" (charging)" if battery.power_plugged else "")
+    return text + "."
+
+
+def _brief_reminders() -> str:
+    end = datetime.now().replace(hour=23, minute=59, second=59)
+    conn = sqlite3.connect(DB_PATH)
+    rows = conn.execute(
+        "SELECT kind, message, due_at FROM reminders WHERE status = 'pending' AND due_at <= ? ORDER BY due_at",
+        (end.isoformat(timespec="seconds"),),
+    ).fetchall()
+    conn.close()
+    if not rows:
+        return "Reminders today: none."
+    return "Reminders today:\n" + "\n".join(
+        f"- {datetime.fromisoformat(d):%H:%M} {m}" for k, m, d in rows)
+
+
+def _brief_news() -> str:
+    import xml.etree.ElementTree as ET
+    feeds = [f.strip() for f in (get_setting("news_feeds") or "").split(",") if f.strip()] or DEFAULT_NEWS_FEEDS
+    per_feed = []
+    for url in feeds:
+        titles = []
+        try:
+            resp = requests.get(url, timeout=8, headers={"User-Agent": "ORACLE/1.0"})
+            resp.raise_for_status()
+            for item in ET.fromstring(resp.content).iter("item"):
+                title = (item.findtext("title") or "").strip()
+                # Google News appends " - Publisher"; keep the headline.
+                title = re.sub(r"\s+-\s+[^-]{2,40}$", "", title) if "news.google" in url else title
+                if title:
+                    titles.append(title)
+                if len(titles) >= 6:
+                    break
+        except Exception as e:
+            print(f"News feed failed ({url}): {e}")
+        per_feed.append(titles)
+    # Alternate between feeds so one source doesn't fill every slot.
+    seen, headlines = set(), []
+    for i in range(6):
+        for titles in per_feed:
+            if i < len(titles) and titles[i].lower()[:60] not in seen:
+                seen.add(titles[i].lower()[:60])
+                headlines.append(titles[i])
+    if not headlines:
+        return "News: couldn't reach the news feeds."
+    return "Top headlines:\n" + "\n".join(f"- {h}" for h in headlines[:6])
+
+
+def get_briefing() -> str:
+    """Gathers the morning briefing: time, weather, calendar, unread mail,
+    system health, today's reminders and top news."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    def run(fn):
+        with no_interactive_login():
+            return fn()
+
+    sections = [
+        ("weather", lambda: get_weather(days=1)),
+        ("calendar", _brief_calendar),
+        ("outlook", _brief_outlook_mail),
+        ("gmail", _brief_gmail),
+        ("system", _brief_system),
+        ("reminders", _brief_reminders),
+        ("news", _brief_news),
+    ]
+    out = [f"It is {datetime.now():%A %d %B, %H:%M}."]
+    pool = ThreadPoolExecutor(max_workers=len(sections))
+    futures = [(name, pool.submit(run, fn)) for name, fn in sections]
+    for name, fut in futures:
+        try:
+            out.append(fut.result(timeout=BRIEFING_SECTION_TIMEOUT))
+        except Exception as e:
+            reason = str(e) or type(e).__name__
+            if "MS_CLIENT_ID" in reason or "Outlook" in reason:
+                reason = "Outlook isn't connected"
+            elif "GOOGLE_CLIENT_SECRET" in reason:
+                reason = "Gmail isn't connected"
+            out.append(f"{name.capitalize()}: unavailable ({reason}).")
+    pool.shutdown(wait=False)
+    return "\n\n".join(out)
+
+
+# ---------------------------------------------------------------------------
 # ALEXA-STYLE MEDIA: play a specific song, control playback, set volume.
 # Songs play on YouTube in the default browser (the owner's choice): yt-dlp
 # finds the top result without an API key, and a watch URL autoplays.
@@ -2116,6 +2276,25 @@ def _get_token_cache_path() -> str:
     return os.path.join(_get_data_dir(), "ms_token_cache.bin")
 
 
+_auth_mode = threading.local()
+
+
+@contextlib.contextmanager
+def no_interactive_login():
+    """Inside this block (on this thread), a service that isn't signed in
+    fails instead of opening a browser sign-in - for unattended work like
+    the morning briefing."""
+    _auth_mode.silent = True
+    try:
+        yield
+    finally:
+        _auth_mode.silent = False
+
+
+def interactive_login_allowed() -> bool:
+    return not getattr(_auth_mode, "silent", False)
+
+
 def _get_graph_token() -> str:
     """
     Returns a valid Microsoft Graph access token, handling the whole MSAL
@@ -2145,6 +2324,8 @@ def _get_graph_token() -> str:
         result = _msal_app.acquire_token_silent(GRAPH_SCOPES, account=accounts[0])
 
     if not result:
+        if not interactive_login_allowed():
+            raise RuntimeError("Outlook isn't signed in")
         result = _msal_app.acquire_token_interactive(GRAPH_SCOPES)
 
     if _token_cache.has_state_changed:
@@ -2349,9 +2530,18 @@ def _get_gmail_token() -> str:
         _gmail_creds = Credentials.from_authorized_user_file(token_path, GMAIL_SCOPES)
 
     if _gmail_creds and _gmail_creds.expired and _gmail_creds.refresh_token:
-        _gmail_creds.refresh(GoogleAuthRequest())
+        try:
+            _gmail_creds.refresh(GoogleAuthRequest())
+        except Exception as e:
+            # A revoked/expired refresh token (invalid_grant - Google expires
+            # them after 7 days for apps in testing mode) used to crash here on
+            # every call. Fall through to a fresh sign-in instead.
+            print(f"Gmail session expired ({e}); a new sign-in is needed.")
+            _gmail_creds = None
 
     if not _gmail_creds or not _gmail_creds.valid:
+        if not interactive_login_allowed():
+            raise RuntimeError("Gmail needs you to sign in again (ask ORACLE to check Gmail)")
         client_secret_path = os.environ.get("GOOGLE_CLIENT_SECRET_PATH")
         if not client_secret_path:
             raise RuntimeError("GOOGLE_CLIENT_SECRET_PATH environment variable is not set.")
@@ -2686,6 +2876,18 @@ TOOLS = [
                 },
                 "required": ["query"],
             },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_briefing",
+            "description": (
+                "Morning briefing data: time, weather, today's calendar, unread mail, system health, "
+                "today's reminders and top news. Use for 'good morning', 'brief me', 'what's my day "
+                "look like' and similar; then summarise it conversationally in under a minute of speech."
+            ),
+            "parameters": {"type": "object", "properties": {}},
         },
     },
     {
@@ -3034,6 +3236,7 @@ AVAILABLE_FUNCTIONS = {
     "web_search": web_search,
     "open_web_search": open_web_search,
     "open_url": open_url,
+    "get_briefing": get_briefing,
     "set_timer": set_timer,
     "set_reminder": set_reminder,
     "list_reminders": list_reminders,
@@ -3385,6 +3588,7 @@ TOOL_LABELS = {
     "web_search": "Searching the web…",
     "open_web_search": "Opening a search…",
     "open_url": "Opening the page…",
+    "get_briefing": "Preparing your briefing…",
     "set_timer": "Setting a timer…",
     "set_reminder": "Setting a reminder…",
     "list_reminders": "Checking your reminders…",

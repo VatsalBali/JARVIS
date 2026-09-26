@@ -74,6 +74,19 @@ RPC_METHODS = {
 MISSED_REMINDER_HOURS = 12  # older ones missed while ORACLE was off are dropped
 
 
+def _seconds_since_input() -> float:
+    """Seconds since the last keyboard/mouse input anywhere in Windows."""
+    import ctypes
+
+    class LASTINPUTINFO(ctypes.Structure):
+        _fields_ = [("cbSize", ctypes.c_uint), ("dwTime", ctypes.c_uint)]
+
+    info = LASTINPUTINFO(cbSize=ctypes.sizeof(LASTINPUTINFO))
+    if not ctypes.windll.user32.GetLastInputInfo(ctypes.byref(info)):
+        return 0.0
+    return ((ctypes.windll.kernel32.GetTickCount() - info.dwTime) & 0xFFFFFFFF) / 1000.0
+
+
 def _reminder_speech(kind: str, message: str, due: datetime, late: timedelta) -> str:
     if late > timedelta(minutes=2):
         return f"While you were away, Sir: at {due:%H:%M} you asked me to remind you: {message}."
@@ -241,6 +254,38 @@ class Backend:
                 print(f"Reminder check failed: {e}", file=sys.stderr)
             time.sleep(1)
 
+    # ---- morning briefing ----
+
+    def start_briefing(self):
+        threading.Thread(target=self._briefing_loop, daemon=True, name="briefing").start()
+
+    def _briefing_loop(self):
+        """Delivers the morning briefing once a day, the first time the owner
+        is at the PC (keyboard/mouse input in the last minute) between
+        briefing_after and briefing_until. Settings: briefing_auto on/off,
+        briefing_after '07:30', briefing_until '12:00'."""
+        while True:
+            try:
+                if self._briefing_due():
+                    facts = core.get_briefing()
+                    if self.voice.announce(facts, label="GOOD MORNING", compose=True):
+                        core.set_setting("briefing_last_date", datetime.now().date().isoformat())
+            except Exception as e:
+                print(f"Briefing check failed: {e}", file=sys.stderr)
+            time.sleep(20)
+
+    def _briefing_due(self) -> bool:
+        if (core.get_setting("briefing_auto") or "on").lower() != "on":
+            return False
+        if self.voice is None or self.voice.muted or self.voice.conversation is not None:
+            return False
+        now = datetime.now()
+        if core.get_setting("briefing_last_date") == now.date().isoformat():
+            return False
+        after = datetime.strptime(core.get_setting("briefing_after") or "07:30", "%H:%M").time()
+        until = datetime.strptime(core.get_setting("briefing_until") or "12:00", "%H:%M").time()
+        return after <= now.time() < until and _seconds_since_input() < 60
+
     def start_voice(self):
         from voice_engine import VoiceEngine  # heavy imports: only when voice is used
         self.voice = VoiceEngine(self._emit_voice, self.session)
@@ -358,6 +403,8 @@ def main():
     if not args.no_voice:
         backend.start_voice()
     backend.start_reminders()
+    if not args.no_voice:
+        backend.start_briefing()
     try:
         asyncio.run(backend.run())
     except KeyboardInterrupt:
