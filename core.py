@@ -37,6 +37,7 @@ import psutil
 import sounddevice as sd
 import numpy as np
 import threading
+import time
 import contextlib
 import re
 from pathlib import Path
@@ -578,6 +579,203 @@ def _find_start_menu_shortcut(app_name: str):
                 if f.lower().endswith(".lnk") and name_lower in f.lower():
                     return os.path.join(root, f)
     return None
+
+
+# ---------------------------------------------------------------------------
+# Closing apps (README 3, "Close apps"; Confirm tier, force-quit warns).
+# A normal close sends each of the app's windows WM_CLOSE - exactly what the
+# window's X button does - so the app can still ask to save changes. Force
+# quit terminates the processes and is only used when asked for.
+# ---------------------------------------------------------------------------
+
+# Spoken names -> process names (without .exe) where the two differ.
+APP_ALIASES = {
+    "word": "winword", "microsoft word": "winword", "excel": "excel", "powerpoint": "powerpnt",
+    "outlook": "outlook", "onenote": "onenote", "edge": "msedge", "microsoft edge": "msedge",
+    "google chrome": "chrome", "vs code": "code", "vscode": "code", "visual studio code": "code",
+    "file explorer": "explorer", "explorer": "explorer", "task manager": "taskmgr",
+    "teams": "ms-teams", "microsoft teams": "ms-teams", "whatsapp": "whatsapp",
+    "command prompt": "cmd", "terminal": "windowsterminal", "windows terminal": "windowsterminal",
+    "paint": "mspaint", "snipping tool": "snippingtool", "calculator": "calculatorapp",
+}
+
+# Never closed or killed, whatever the model asks for.
+PROTECTED_PROCESSES = {
+    "system", "registry", "smss", "csrss", "wininit", "winlogon", "services", "lsass", "svchost",
+    "dwm", "fontdrvhost", "sihost", "ctfmon", "searchhost", "startmenuexperiencehost",
+    "shellexperiencehost", "textinputhost", "lockapp", "runtimebroker", "securityhealthsystray",
+    "applicationframehost", "conhost", "audiodg", "spoolsv", "taskhostw", "memory compression",
+}
+
+_ORACLE_DIR = os.path.dirname(os.path.abspath(__file__)).lower()
+
+
+def _oracle_pids() -> set:
+    """This process. Not its parents (Explorer, a terminal) or children
+    (apps ORACLE launched) - those are the owner's to close; the orb and
+    other ORACLE processes are recognised by their paths instead."""
+    return {os.getpid()}
+
+
+def _is_oracle_process(proc, oracle_pids=None) -> bool:
+    """This process, the orb, or anything running a script from the ORACLE
+    folder (the backend is a plain python.exe)."""
+    try:
+        if proc.pid in (oracle_pids or _oracle_pids()):
+            return True
+        return any(part.lower().startswith(_ORACLE_DIR) for part in [proc.exe() or ""] + proc.cmdline())
+    except (psutil.Error, OSError):
+        return False
+
+
+def _top_windows() -> list:
+    """Visible, un-owned, titled top-level windows: [(hwnd, pid, title, class)]."""
+    import ctypes
+    from ctypes import wintypes
+    user32, dwmapi = ctypes.windll.user32, ctypes.windll.dwmapi
+    found = []
+
+    @ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+    def visit(hwnd, _):
+        if not user32.IsWindowVisible(hwnd) or user32.GetWindow(hwnd, 4):  # GW_OWNER
+            return True
+        cloaked = wintypes.DWORD()
+        dwmapi.DwmGetWindowAttribute(hwnd, 14, ctypes.byref(cloaked), ctypes.sizeof(cloaked))  # DWMWA_CLOAKED
+        if cloaked.value:
+            return True
+        length = user32.GetWindowTextLengthW(hwnd)
+        if not length:
+            return True
+        title = ctypes.create_unicode_buffer(length + 1)
+        user32.GetWindowTextW(hwnd, title, length + 1)
+        cls = ctypes.create_unicode_buffer(256)
+        user32.GetClassNameW(hwnd, cls, 256)
+        pid = wintypes.DWORD()
+        user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+        found.append((hwnd, pid.value, title.value, cls.value))
+        return True
+
+    user32.EnumWindows(visit, 0)
+    return found
+
+
+def _app_windows() -> list:
+    """Closable app windows: [{hwnd, pid, proc, title}] where proc is the
+    process name (UWP apps hosted in ApplicationFrameHost are named by title)."""
+    apps = []
+    oracle = _oracle_pids()
+    for hwnd, pid, title, cls in _top_windows():
+        try:
+            p = psutil.Process(pid)
+            name = os.path.splitext(p.name())[0].lower()
+        except (psutil.Error, OSError):
+            continue
+        if _is_oracle_process(p, oracle):
+            continue
+        if name == "explorer" and cls != "CabinetWClass":
+            continue  # the taskbar and desktop, not a folder window
+        if name == "applicationframehost":
+            name = title.lower()
+        elif name in PROTECTED_PROCESSES:
+            continue
+        apps.append({"hwnd": hwnd, "pid": pid, "proc": name, "title": title})
+    return apps
+
+
+def _squash(s: str) -> str:
+    return re.sub(r"[^a-z0-9]", "", s.lower())
+
+
+def _app_target(app_name: str):
+    key = app_name.lower().strip().removesuffix(".exe").strip()
+    return key, APP_ALIASES.get(key, key)
+
+
+def _match_app_windows(app_name: str, with_kind: bool = False):
+    """Windows belonging to app_name. kind is "process" when matched by the
+    program's name, "title" when only a window title matched."""
+    key, target = _app_target(app_name)
+    windows = _app_windows()
+    # Best: the process name. Then a process name containing it. Only then
+    # window titles, so "close chrome" never closes a file named chrome.txt.
+    for kind, test in (("process", lambda w: _squash(w["proc"]) == _squash(target)),
+                       ("process", lambda w: len(_squash(target)) >= 4 and _squash(target) in _squash(w["proc"])),
+                       ("title", lambda w: len(key) >= 3 and key in w["title"].lower())):
+        hits = [w for w in windows if test(w)]
+        if hits:
+            return (hits, kind) if with_kind else hits
+    return ([], None) if with_kind else []
+
+
+def list_open_apps() -> str:
+    """The apps with open windows right now, grouped by program."""
+    groups = {}
+    for w in _app_windows():
+        groups.setdefault(w["proc"], []).append(w["title"])
+    if not groups:
+        return "No app windows are open."
+    lines = [f"- {proc}: {len(titles)} window(s), e.g. {titles[0][:80]!r}" for proc, titles in sorted(groups.items())]
+    return "Open apps:\n" + "\n".join(lines)
+
+
+def _describe_close(args: dict):
+    name = args.get("app_name", "")
+    hits = _match_app_windows(name)
+    titles = "\n".join(f"• {w['title'][:90]}" for w in hits[:6]) + ("\n…" if len(hits) > 6 else "")
+    if args.get("force"):
+        return (f"Force-quit {name}? Unsaved work will be lost.", titles or "No open window matched; its processes will be ended.")
+    return (f"Close {name}?", titles or "No open window matched.")
+
+
+def close_app(app_name: str, force: bool = False) -> str:
+    """Closes every window of an app, like clicking its X. force=True ends
+    its processes instead (unsaved work is lost)."""
+    import ctypes
+    if sys.platform != "win32":
+        return "Closing apps is only supported on Windows."
+    if not _squash(app_name):
+        return "Error: say which app to close."
+    hits, kind = _match_app_windows(app_name, with_kind=True)
+
+    if force:
+        # Matched by program name: end every process of that program (Chrome
+        # runs dozens). Matched only by a window title: end just the process
+        # behind those windows, never every python.exe or java.exe.
+        _, target = _app_target(app_name)
+        names = {w["proc"] for w in hits} if kind == "process" else set()
+        pids = {w["pid"] for w in hits}
+        oracle = _oracle_pids()
+        procs = []
+        for p in psutil.process_iter(["name"]):
+            stem = os.path.splitext(p.info["name"] or "")[0].lower()
+            by_name = kind != "title" and (stem in names or _squash(stem) == _squash(target))
+            if (by_name or p.pid in pids) and stem not in PROTECTED_PROCESSES \
+                    and stem != "explorer" and not _is_oracle_process(p, oracle):
+                procs.append(p)
+        if not procs:
+            return f"No running app matched '{app_name}'."
+        for p in procs:
+            with contextlib.suppress(psutil.Error):
+                p.kill()
+        _, alive = psutil.wait_procs(procs, timeout=5)
+        if alive:
+            return f"Ended {len(procs) - len(alive)} of {len(procs)} '{app_name}' processes; {len(alive)} refused (they may need admin rights)."
+        return f"Force-quit {app_name} ({len(procs)} process{'es' if len(procs) != 1 else ''})."
+
+    if not hits:
+        return f"No open window matched '{app_name}'. Call list_open_apps to see what's open."
+    WM_CLOSE = 0x0010
+    for w in hits:
+        ctypes.windll.user32.PostMessageW(w["hwnd"], WM_CLOSE, 0, 0)
+    deadline = time.time() + 5
+    while time.time() < deadline:
+        left = [w for w in hits if ctypes.windll.user32.IsWindow(w["hwnd"]) and ctypes.windll.user32.IsWindowVisible(w["hwnd"])]
+        if not left:
+            return f"Closed {app_name} ({len(hits)} window{'s' if len(hits) != 1 else ''})."
+        time.sleep(0.25)
+    return (f"Closed {len(hits) - len(left)} of {len(hits)} {app_name} windows. Still open: "
+            + "; ".join(w["title"][:60] for w in left)
+            + ". It is probably asking whether to save changes. Tell the owner; force-quit only if they ask.")
 
 
 def launch_app(app_name: str) -> str:
@@ -2732,6 +2930,35 @@ TOOLS = [
     {
         "type": "function",
         "function": {
+            "name": "close_app",
+            "description": (
+                "Close an application's windows, like clicking its X, so it can still ask to save work "
+                "(e.g. 'chrome', 'word', 'spotify', 'file explorer'). The owner is asked to confirm. "
+                "Set force=true ONLY when the owner explicitly asks to force-quit or kill an app, or it "
+                "didn't close and they want it gone - force-quitting loses unsaved work. If unsure what "
+                "the app is called, call list_open_apps first."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "app_name": {"type": "string", "description": "The app's name, e.g. 'chrome' or 'word'."},
+                    "force": {"type": "boolean", "description": "End its processes instead of asking it to close. Default false."},
+                },
+                "required": ["app_name"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_open_apps",
+            "description": "List the apps that have windows open right now, with a sample window title each.",
+            "parameters": {"type": "object", "properties": {}},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "launch_app",
             "description": (
                 "Launch an application by name (e.g. 'notepad', 'chrome', 'spotify', "
@@ -3238,6 +3465,8 @@ AVAILABLE_FUNCTIONS = {
     "list_files": list_files,
     "open_file": open_file,
     "launch_app": launch_app,
+    "close_app": close_app,
+    "list_open_apps": list_open_apps,
     "read_file": read_file,
     "move_file": move_file,
     "delete_file": delete_file,
@@ -3551,6 +3780,11 @@ TOOL_TIERS = {
         "tier": TIER_WARN,
         "describe": lambda a: ("Delete this calendar event? This can't be undone.", _calendar_event_summary(a.get("event_id", ""))),
     },
+    "close_app": {
+        # A normal close lets the app ask to save; force-quit loses work.
+        "tier": lambda a: TIER_WARN if a.get("force") else TIER_CONFIRM,
+        "describe": _describe_close,
+    },
     "run_shell_command": {
         "tier": TIER_CONFIRM,
         "when": _shell_needs_confirm,
@@ -3590,6 +3824,8 @@ TOOL_LABELS = {
     "list_files": "Looking through your files…",
     "open_file": "Opening that file…",
     "launch_app": "Launching it…",
+    "close_app": "Closing it…",
+    "list_open_apps": "Looking at what's open…",
     "read_file": "Reading the file…",
     "move_file": "Moving the file…",
     "delete_file": "Sending it to the Recycle Bin…",
@@ -3698,7 +3934,7 @@ def execute_tool(fn_map: dict, fn_name: str, raw_args, speaker_verified=None) ->
                 title, details = rule["describe"](args)
             except Exception:
                 title, details = f"Run {fn_name}?", json.dumps(args, indent=2, default=str)
-            tier = rule["tier"]
+            tier = rule["tier"](args) if callable(rule["tier"]) else rule["tier"]
         else:
             title = f"Allow {fn_name.replace('_', ' ')}?"
             details = json.dumps(args, indent=2, default=str) if args else ""
