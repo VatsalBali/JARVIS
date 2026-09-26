@@ -3930,6 +3930,9 @@ TOOL_LABELS = {
     "run_sql_query": "Querying the database…",
 }
 
+import messaging  # noqa: E402  (imports core; everything it needs is defined above)
+messaging.register(TOOLS, AVAILABLE_FUNCTIONS, TOOL_TIERS, TOOL_LABELS, TIER_CONFIRM)
+
 _tool_listener = None
 
 

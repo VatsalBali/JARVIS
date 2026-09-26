@@ -315,6 +315,44 @@ class Backend:
                 print(f"Alert check failed: {e}", file=sys.stderr)
             time.sleep(10)
 
+    # ---- incoming messages (README 3.8, unified inbox) ----
+
+    def start_messages(self):
+        threading.Thread(target=self._message_loop, daemon=True, name="messages").start()
+
+    def _message_loop(self):
+        """Reads new WhatsApp notifications into the inbox every 2 s and
+        announces them ("V, a message from Mum on WhatsApp: ...") when ORACLE
+        may speak. WhatsApp shows its own toast, so none is added. Setting
+        announce_messages on/off; quiet hours as for alerts."""
+        import alerts
+        import messaging
+        try:
+            watcher = messaging.MessageWatcher()
+        except Exception as e:
+            print(f"Message watcher unavailable: {e}", file=sys.stderr)
+            return
+        if not watcher.allowed:
+            print("Notification access is off; incoming messages won't be announced.", file=sys.stderr)
+            return
+        pending = []   # (monotonic expiry, inbox id, text)
+        while True:
+            try:
+                for rid, app, chat, text in watcher.poll():
+                    pending.append((time.monotonic() + 600, rid, messaging.announcement(app, chat, text)))
+                now = time.monotonic()
+                pending = [p for p in pending if p[0] > now]
+                if (core.get_setting("announce_messages") or "on").lower() != "on":
+                    pending = []
+                elif pending and self._may_speak_alert(alerts.in_quiet_hours()):
+                    _, rid, text = pending[0]
+                    if self.voice.announce(text, label="MESSAGE"):
+                        pending.pop(0)
+                        messaging.mark_announced(rid)
+            except Exception as e:
+                print(f"Message check failed: {e}", file=sys.stderr)
+            time.sleep(2)
+
     def _may_speak_alert(self, quiet: bool) -> bool:
         """Not in quiet hours, not muted or mid-conversation, and only when the
         owner is at the PC (input in the last 5 minutes) - otherwise the
@@ -445,6 +483,7 @@ def main():
     if not args.no_voice:
         backend.start_briefing()
     backend.start_alerts()
+    backend.start_messages()
     try:
         asyncio.run(backend.run())
     except KeyboardInterrupt:

@@ -923,6 +923,7 @@ class Conversation:
         config = gemini_voice._live_config(
             core.SYSTEM_PROMPT + VOICE_STYLE
             + f" The current local date and time is {datetime.now():%A %d %B %Y, %H:%M}."
+            + _message_context()
         )
         self.engine.ducker.duck()
         self._set_mode("listening")
@@ -965,6 +966,15 @@ def _chime() -> bytes:
 ACK_PHRASES = ["Yes, Sir?", "Sir?", "At your service.", "I'm listening.", "How can I help?"]
 ACK_LEAD_IN_SEC = 0.25   # silence first, so Bluetooth headphones waking up don't clip it
 ACK_WAIT_SEC = 0.35      # speech within this long after the wake word: no ack, it's the command
+
+
+def _message_context() -> str:
+    """Who the last announced message was from, so "reply that..." works."""
+    try:
+        import messaging
+        return messaging.context_line()
+    except Exception:
+        return ""
 
 
 def _output_name() -> str:
