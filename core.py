@@ -1850,6 +1850,34 @@ def _geocode(location: str):
     return results[0] if results else None
 
 
+def configure_alerts(enabled: bool = None, quiet_hours: str = None, battery_levels: str = None) -> str:
+    """Settings for proactive alerts (alerts.py): alerts, alerts_quiet, alert_battery_levels."""
+    if enabled is not None:
+        set_setting("alerts", "on" if enabled else "off")
+    if quiet_hours is not None:
+        q = quiet_hours.strip().lower()
+        if q not in ("off", "none", ""):
+            try:
+                a, b = (datetime.strptime(x.strip(), "%H:%M") for x in q.split("-"))
+            except ValueError:
+                return "Error: quiet hours must look like '23:00-07:00', or 'off'."
+            q = f"{a:%H:%M}-{b:%H:%M}"
+        set_setting("alerts_quiet", q or "off")
+    if battery_levels is not None:
+        try:
+            levels = sorted({int(x) for x in re.findall(r"\d+", battery_levels)}, reverse=True)
+        except ValueError:
+            levels = []
+        if not levels or not all(1 <= x <= 99 for x in levels):
+            return "Error: battery levels must be percentages like '20,10'."
+        set_setting("alert_battery_levels", ",".join(map(str, levels)))
+    state = get_setting("alerts") or "on"
+    quiet = get_setting("alerts_quiet") or "23:00-07:00"
+    levels = get_setting("alert_battery_levels") or "20,10"
+    return (f"Alerts are {state}. Quiet hours (notifications only, no speech): {quiet}. "
+            f"Battery warnings at {levels}%.")
+
+
 def set_home_location(location: str) -> str:
     """Saves the owner's home city for weather, e.g. 'Prague' or 'Springfield, Illinois'."""
     try:
@@ -3212,6 +3240,26 @@ TOOLS = [
     {
         "type": "function",
         "function": {
+            "name": "configure_alerts",
+            "description": (
+                "Change ORACLE's proactive alerts (it speaks up about low battery, the PC under strain, "
+                "a nearly full disk, and meetings about to start). Turn them on/off, set quiet hours when "
+                "it only shows notifications, or set the battery levels it warns at. Omit what isn't changing; "
+                "with no arguments it reports the current settings."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "enabled": {"type": "boolean"},
+                    "quiet_hours": {"type": "string", "description": "'HH:MM-HH:MM' (24-hour, may cross midnight), or 'off'."},
+                    "battery_levels": {"type": "string", "description": "Comma-separated percentages, e.g. '20,10'."},
+                },
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "play_music",
             "description": (
                 "Play a specific song, artist, album, playlist or kind of music, like a "
@@ -3483,6 +3531,7 @@ AVAILABLE_FUNCTIONS = {
     "cancel_reminder": cancel_reminder,
     "get_weather": get_weather,
     "set_home_location": set_home_location,
+    "configure_alerts": configure_alerts,
     "play_music": play_music,
     "media_control": media_control,
     "set_volume": set_volume,
@@ -3861,6 +3910,7 @@ TOOL_LABELS = {
     "cancel_reminder": "Cancelling it…",
     "get_weather": "Checking the weather…",
     "set_home_location": "Noting where you live…",
+    "configure_alerts": "Adjusting your alerts…",
     "play_music": "Finding it on YouTube…",
     "media_control": "On it…",
     "set_volume": "Adjusting the volume…",

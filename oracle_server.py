@@ -286,6 +286,45 @@ class Backend:
         until = datetime.strptime(core.get_setting("briefing_until") or "12:00", "%H:%M").time()
         return after <= now.time() < until and _seconds_since_input() < 60
 
+    # ---- proactive alerts ----
+
+    def start_alerts(self):
+        threading.Thread(target=self._alert_loop, daemon=True, name="alerts").start()
+
+    def _alert_loop(self):
+        """Every 10 s asks alerts.AlertMonitor what's worth saying. Each alert
+        is a toast straight away; the spoken version waits until ORACLE may
+        speak (see _may_speak_alert) and is dropped once stale."""
+        import alerts
+        monitor = alerts.AlertMonitor()
+        pending = []
+        while True:
+            try:
+                if (core.get_setting("alerts") or "on").lower() == "on":
+                    for alert in monitor.check():
+                        core.send_notification(f"ORACLE: {alert.title}", alert.body)
+                        pending = [a for a in pending if a.key != alert.key] + [alert]
+                    now = time.monotonic()
+                    pending = [a for a in pending if not a.stale(now)]
+                    if pending and self._may_speak_alert(alerts.in_quiet_hours()):
+                        if self.voice.announce(pending[0].speech, label="ALERT"):
+                            pending.pop(0)
+                else:
+                    pending = []
+            except Exception as e:
+                print(f"Alert check failed: {e}", file=sys.stderr)
+            time.sleep(10)
+
+    def _may_speak_alert(self, quiet: bool) -> bool:
+        """Not in quiet hours, not muted or mid-conversation, and only when the
+        owner is at the PC (input in the last 5 minutes) - otherwise the
+        alert waits, and the toast stays in the notification centre."""
+        if quiet or self.voice is None or self.voice.muted or not self.voice.mic.running:
+            return False
+        if self.voice.conversation is not None:
+            return False
+        return _seconds_since_input() < 300
+
     def start_voice(self):
         from voice_engine import VoiceEngine  # heavy imports: only when voice is used
         self.voice = VoiceEngine(self._emit_voice, self.session)
@@ -405,6 +444,7 @@ def main():
     backend.start_reminders()
     if not args.no_voice:
         backend.start_briefing()
+    backend.start_alerts()
     try:
         asyncio.run(backend.run())
     except KeyboardInterrupt:
