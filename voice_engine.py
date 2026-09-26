@@ -338,10 +338,12 @@ def _voiced(frame: np.ndarray, floor: float) -> bool:
 # Audio out + ducking
 # ---------------------------------------------------------------------------
 
-PREBUFFER_SEC = 0.08  # jitter buffer before (re)starting playback; Gemini
-                      # sends audio ~5x faster than real time, so little is needed
+PREBUFFER_SEC = 0.3   # jitter buffer before (re)starting playback. Gemini sends
+                      # audio ~4x faster than real time on average, but with gaps
+                      # of up to ~0.3 s between early chunks (measured).
 FADE_SAMPLES = 120    # 5 ms fades where playback starts/stops, so no clicks
-OUTPUT_LATENCY = 0.1  # device buffer; "high" was 0.2 s of extra delay
+OUTPUT_LATENCY = 0.2  # device buffer. 0.1 s left too little headroom on
+                      # Bluetooth headphones when the callback was held up.
 
 
 class Player:
@@ -361,7 +363,10 @@ class Player:
         self.underflows = 0
         self.rebuffers = 0
         self.played_samples = 0
-        self.tap = [] if os.environ.get("ORACLE_AUDIO_TAP") else None  # debug: keep what was played
+        self.late_callbacks = 0
+        self.max_gap = 0.0
+        self._last_cb = 0.0
+        self.tap =[] if os.environ.get("ORACLE_AUDIO_TAP") else None  # debug: keep what was played
         self._prebuffer = int(OUTPUT_RATE * PREBUFFER_SEC) * 2
         self._stream = sd.OutputStream(
             samplerate=OUTPUT_RATE, channels=1, dtype="int16",
@@ -372,6 +377,15 @@ class Player:
     def _callback(self, outdata, frames, time_info, status):
         if status.output_underflow:
             self.underflows += 1  # the driver starved: audible as a crackle
+        # MME doesn't always flag underflows, so also time the callbacks: one
+        # arriving much later than a block's length means Python held it up.
+        now = time.perf_counter()
+        if self._last_cb:
+            gap = now - self._last_cb
+            self.max_gap = max(self.max_gap, gap)
+            if gap > 1.5 * frames / OUTPUT_RATE:
+                self.late_callbacks += 1
+        self._last_cb = now
         need = frames * 2
         starting = False
         with self._lock:
@@ -570,6 +584,9 @@ class Conversation:
             "audio_played_s": round(p.played_samples / OUTPUT_RATE, 2) if p else 0,
             "rebuffers": p.rebuffers if p else 0,
             "underflows": p.underflows if p else 0,
+            "late_callbacks": p.late_callbacks if p else 0,
+            "max_callback_gap_ms": round(p.max_gap * 1000) if p else 0,
+            "output": _output_name(),
             "gated_s": round(self.stats["gated_frames"] / FRAMES_PER_SEC, 1),
             # + PREBUFFER_SEC + OUTPUT_LATENCY until it's audible
             "reply_delay_s": self.stats.get("reply_delays", []),
@@ -938,14 +955,18 @@ ACK_LEAD_IN_SEC = 0.25   # silence first, so Bluetooth headphones waking up don'
 ACK_WAIT_SEC = 0.35      # speech within this long after the wake word: no ack, it's the command
 
 
+def _output_name() -> str:
+    try:
+        return sd.query_devices(kind="output")["name"]
+    except Exception:
+        return "?"
+
+
 def _output_is_headphones() -> bool:
     """Headphones can't leak ORACLE's voice back into the mic, so the mic
     needn't be muted while it speaks. Windows names these endpoints
     "Headphones (...)" / "Headset (...)"; anything else is treated as speakers."""
-    try:
-        name = sd.query_devices(kind="output")["name"].lower()
-    except Exception:
-        return False
+    name = _output_name().lower()
     return any(w in name for w in ("headphone", "headset", "earbud", "earphone", "airpods", "buds"))
 
 
@@ -1036,20 +1057,29 @@ async def _speak(text: str, compose: bool = False) -> tuple:
         prompt = f'Read this aloud exactly, and nothing else: "{text}"'
     config = gemini_voice._live_config(system)
     config["tools"] = []
-    pcm, marks, words = bytearray(), [], []
-    async with contextlib.AsyncExitStack() as stack:
-        session = await gemini_voice.connect_live(stack, config)
-        await session.send_client_content(
-            turns=types.Content(role="user", parts=[types.Part(text=prompt)]), turn_complete=True
-        )
-        async for response in session.receive():
-            start = len(pcm)
-            if response.data:
-                pcm += gemini_voice.pcm_bytes(response.data)
-            sc = response.server_content
-            if sc and sc.output_transcription and sc.output_transcription.text:
-                words.append(sc.output_transcription.text)
-                marks.append((start, "".join(words).strip()))
+    # For text input, the Live model sometimes returns the whole transcript
+    # and turn_complete with no audio at all (about 1 in 3 in testing,
+    # whatever the wording). Asking again fixes it.
+    for attempt in range(3):
+        pcm, marks, words = bytearray(), [], []
+        async with contextlib.AsyncExitStack() as stack:
+            session = await gemini_voice.connect_live(stack, config)
+            await session.send_client_content(
+                turns=types.Content(role="user", parts=[types.Part(text=prompt)]), turn_complete=True
+            )
+            async for response in session.receive():
+                start = len(pcm)
+                if response.data:
+                    pcm += gemini_voice.pcm_bytes(response.data)
+                sc = response.server_content
+                if sc and sc.output_transcription and sc.output_transcription.text:
+                    words.append(sc.output_transcription.text)
+                    marks.append((start, "".join(words).strip()))
+                if sc and sc.turn_complete:
+                    break
+        if pcm:
+            break
+        print(f"Speech came back without audio (attempt {attempt + 1}); retrying.")
     return bytes(pcm), marks
 
 
