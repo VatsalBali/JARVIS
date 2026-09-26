@@ -1757,21 +1757,24 @@ def _brief_outlook_mail() -> str:
 
 
 def _brief_gmail() -> str:
-    label = _gmail_request("GET", "/users/me/labels/INBOX")
-    label.raise_for_status()
-    n = label.json().get("messagesUnread", 0)
-    if not n:
-        return "Gmail: no unread mail."
-    listing = _gmail_request("GET", "/users/me/messages", params={"q": "is:unread in:inbox", "maxResults": 3})
+    # Only what arrived since yesterday in the Primary tab: an inbox with
+    # thousands of old unread promotions says nothing useful in a briefing.
+    listing = _gmail_request("GET", "/users/me/messages", params={
+        "q": "is:unread in:inbox category:primary newer_than:1d", "maxResults": 50})
     listing.raise_for_status()
+    messages = listing.json().get("messages", [])
+    n = len(messages)
+    if not n:
+        return "Gmail: no new mail since yesterday."
     items = []
-    for m in listing.json().get("messages", []):
+    for m in messages[:3]:
         meta = _gmail_request("GET", f"/users/me/messages/{m['id']}",
                               params={"format": "metadata", "metadataHeaders": ["From", "Subject"]})
         headers = {h["name"]: h["value"] for h in meta.json().get("payload", {}).get("headers", [])}
         sender = re.sub(r"\s*<[^>]+>", "", headers.get("From", "?")).strip('" ')
         items.append(f"- {sender}: {headers.get('Subject', '(no subject)')}")
-    return f"Gmail: {n} unread. Latest:\n" + "\n".join(items)
+    count = "50+" if n >= 50 else str(n)
+    return f"Gmail: {count} new unread since yesterday (Primary). Latest:\n" + "\n".join(items)
 
 
 def _brief_system() -> str:
@@ -2253,16 +2256,20 @@ def send_notification(title: str, message: str = "") -> str:
 # something distributed as a standalone .exe.
 #
 # SETUP (one-time, on your end - I can't do this part for you):
-#   1. Go to https://portal.azure.com -> Microsoft Entra ID -> App registrations
-#   2. New registration - name it whatever, "Personal" account types is fine
-#   3. No redirect URI needed for the interactive flow used here
-#   4. Copy the "Application (client) ID" and set it as an environment
-#      variable: MS_CLIENT_ID
-#   5. Under "API permissions", add: Mail.ReadWrite, Mail.Send,
-#      Calendars.ReadWrite (delegated permissions, not application)
+#   1. Go to https://entra.microsoft.com -> App registrations -> New registration
+#   2. Supported account types: "Accounts in any organizational directory
+#      and personal Microsoft accounts"
+#   3. Redirect URI: platform "Public client/native (mobile & desktop)",
+#      value http://localhost  (the browser sign-in returns there)
+#   4. Copy the "Application (client) ID" into the environment variable
+#      MS_CLIENT_ID. If you chose "personal Microsoft accounts only",
+#      also set MS_TENANT=consumers.
+#   5. API permissions are requested at sign-in (Mail.ReadWrite, Mail.Send,
+#      Calendars.ReadWrite, delegated), so nothing to add there.
 #
-# First run opens your browser for a one-time login/consent. After that,
-# the token is cached to disk and silently refreshed - no repeated logins.
+# Then run connect_accounts.py (or ask ORACLE to check Outlook) for the
+# one-time browser sign-in. After that the token is cached to disk and
+# silently refreshed - no repeated logins.
 # ---------------------------------------------------------------------------
 
 GRAPH_SCOPES = ["Mail.ReadWrite", "Mail.Send", "Calendars.ReadWrite"]
@@ -2316,7 +2323,9 @@ def _get_graph_token() -> str:
                 _token_cache.deserialize(f.read())
 
     if _msal_app is None:
-        _msal_app = msal.PublicClientApplication(client_id, token_cache=_token_cache)
+        tenant = os.environ.get("MS_TENANT", "common")
+        _msal_app = msal.PublicClientApplication(
+            client_id, authority=f"https://login.microsoftonline.com/{tenant}", token_cache=_token_cache)
 
     result = None
     accounts = _msal_app.get_accounts()
@@ -2326,7 +2335,7 @@ def _get_graph_token() -> str:
     if not result:
         if not interactive_login_allowed():
             raise RuntimeError("Outlook isn't signed in")
-        result = _msal_app.acquire_token_interactive(GRAPH_SCOPES)
+        result = _msal_app.acquire_token_interactive(GRAPH_SCOPES, prompt="select_account", timeout=300)
 
     if _token_cache.has_state_changed:
         with open(_get_token_cache_path(), "w") as f:
@@ -2546,7 +2555,9 @@ def _get_gmail_token() -> str:
         if not client_secret_path:
             raise RuntimeError("GOOGLE_CLIENT_SECRET_PATH environment variable is not set.")
         flow = InstalledAppFlow.from_client_secrets_file(client_secret_path, GMAIL_SCOPES)
-        _gmail_creds = flow.run_local_server(port=0)
+        _gmail_creds = flow.run_local_server(port=0, timeout_seconds=300)
+        if _gmail_creds is None:
+            raise RuntimeError("Gmail sign-in wasn't completed")
 
     with open(token_path, "w") as f:
         f.write(_gmail_creds.to_json())
