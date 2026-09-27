@@ -71,7 +71,7 @@ class ChatSession:
             )
         if self.current_agent == "coding":
             return core.run_coding_conversation(text, self.history, conversation_id)
-        return core.run_conversation(text, self.history, conversation_id)
+        return core.run_conversation(text, self.history, conversation_id, context=core.screen.context_line())
 
     def list_conversations(self) -> list:
         return core.list_conversations(agent=self.current_agent)

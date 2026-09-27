@@ -3933,6 +3933,7 @@ TOOL_LABELS = {
 # Messaging adds its tools to the lists above when it loads (whichever of
 # core/messaging is imported first). Everything it needs is defined by here.
 import messaging  # noqa: E402,F401
+import screen  # noqa: E402,F401  (screen awareness: look_at_screen)
 
 _tool_listener = None
 
@@ -4072,15 +4073,23 @@ def trim_history(history: list) -> list:
     return system_msgs + trimmed
 
 
-def run_conversation(user_input: str, history: list, conversation_id: int = None) -> str:
+def run_conversation(user_input: str, history: list, conversation_id: int = None, context: str = "") -> str:
     """
     Sends the user's message + history to the model. The model may need several
     rounds of tool calls - each result can prompt the next call - so we keep
     going until it returns a plain text answer. conversation_id tags every
     saved message to the right thread so it shows up correctly if this
     conversation is reopened later from the sidebar.
+
+    context: a note for this request only (what's on screen); it goes in the
+    in-memory history as a system message but is never saved to the DB.
     """
+    # Only the latest screen note matters: drop earlier ones.
+    history[:] = [m for i, m in enumerate(history)
+                  if not (i and m.get("role") == "system" and str(m.get("content", "")).startswith("Right now the owner is in"))]
     history[:] = trim_history(history)
+    if context:
+        history.append({"role": "system", "content": context.strip()})
     user_msg = {"role": "user", "content": user_input}
     history.append(user_msg)
     save_message(user_msg, conversation_id)

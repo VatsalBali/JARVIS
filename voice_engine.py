@@ -924,6 +924,7 @@ class Conversation:
             core.SYSTEM_PROMPT + VOICE_STYLE
             + f" The current local date and time is {datetime.now():%A %d %B %Y, %H:%M}."
             + _message_context()
+            + _screen_context()
         )
         self.engine.ducker.duck()
         self._set_mode("listening")
@@ -973,6 +974,15 @@ def _message_context() -> str:
     try:
         import messaging
         return messaging.context_line()
+    except Exception:
+        return ""
+
+
+def _screen_context() -> str:
+    """The app and window the owner is in, so "summarise this" works."""
+    try:
+        import screen
+        return screen.context_line()
     except Exception:
         return ""
 

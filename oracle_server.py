@@ -501,6 +501,7 @@ def main():
         threading.Thread(target=watch_parent, daemon=True).start()
 
     backend = Backend(port=args.port)
+    core.screen.start_tracker()
     if not args.no_voice:
         backend.start_voice()
     if not args.no_background:
