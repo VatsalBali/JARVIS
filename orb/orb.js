@@ -180,6 +180,11 @@
         bridge.reportMuted(!!msg.value);
         if (state === 'asleep') setText(msg.value ? 'Microphone muted' : DEFAULT_TEXT.asleep);
         break;
+      case 'open_chat':
+        // "Open the chat" by voice. Only the orb acts on it (the chat window
+        // gets the event too), so there's one window, opened once.
+        if (bridge) bridge.openChat();
+        break;
     }
   }
 

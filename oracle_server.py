@@ -211,6 +211,26 @@ class Backend:
         }
         core.TOOL_LABELS["learn_owner_voice"] = "Getting ready to learn your voice…"
 
+        def open_chat_window() -> str:
+            self.emit({"type": "open_chat"})
+            return "The chat window is open on screen; the owner can type there."
+
+        core.AVAILABLE_FUNCTIONS["open_chat_window"] = open_chat_window
+        if not any(t["function"]["name"] == "open_chat_window" for t in core.TOOLS):
+            core.TOOLS.append({
+                "type": "function",
+                "function": {
+                    "name": "open_chat_window",
+                    "description": (
+                        "Open ORACLE's chat window so the owner can type: when they ask for the chat or "
+                        "to type something, or when an exact spelling matters and is hard to say aloud "
+                        "(an email address, a username, a WhatsApp chat name) - offer it then."
+                    ),
+                    "parameters": {"type": "object", "properties": {}},
+                },
+            })
+        core.TOOL_LABELS["open_chat_window"] = "Opening the chat…"
+
     def _on_voice_state(self, event: dict):
         """Runs deferred enrolment once a conversation has gone to sleep."""
         if event.get("type") == "state" and event.get("state") == "asleep" and self._enroll_after_conversation:
@@ -459,6 +479,10 @@ def main():
     parser.add_argument("--port", type=int, default=0, help="0 picks a free port")
     parser.add_argument("--no-voice", action="store_true", help="don't open the microphone (testing)")
     parser.add_argument(
+        "--no-background", action="store_true",
+        help="no reminders, alerts or message announcements (a test copy beside the real one)",
+    )
+    parser.add_argument(
         "--parent-pid", type=int, default=0,
         help="exit when this process (the Electron app) quits or crashes",
     )
@@ -479,11 +503,12 @@ def main():
     backend = Backend(port=args.port)
     if not args.no_voice:
         backend.start_voice()
-    backend.start_reminders()
-    if not args.no_voice:
-        backend.start_briefing()
-    backend.start_alerts()
-    backend.start_messages()
+    if not args.no_background:
+        backend.start_reminders()
+        if not args.no_voice:
+            backend.start_briefing()
+        backend.start_alerts()
+        backend.start_messages()
     try:
         asyncio.run(backend.run())
     except KeyboardInterrupt:

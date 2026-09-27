@@ -11,7 +11,7 @@
 //   ORACLE_PYTHON=<python.exe>     pick the Python interpreter
 //   ORACLE_ORB_ASLEEP=hide         hide the orb while asleep (default: it stays on screen)
 
-const { app, BrowserWindow, Tray, Menu, ipcMain, globalShortcut, screen, nativeImage } = require('electron');
+const { app, BrowserWindow, Tray, Menu, ipcMain, globalShortcut, screen, nativeImage, dialog } = require('electron');
 const { spawn } = require('child_process');
 const path = require('path');
 const readline = require('readline');
@@ -26,6 +26,7 @@ const HIDE_WHEN_ASLEEP = process.env.ORACLE_ORB_ASLEEP === 'hide';
 // it starts ORACLE when it isn't running, and talks when it is.
 const TALK_HOTKEYS = ['Control+Alt+O', 'Control+Alt+Space'];
 const MUTE_HOTKEY = 'Control+Alt+M';
+const CHAT_HOTKEY = 'Control+Alt+C';
 
 let backend = null;
 let backendInfo = null;
@@ -33,6 +34,14 @@ let orb = null;
 let tray = null;
 let quitting = false;
 let muted = false;
+
+// Development: ORACLE_DEV_PROFILE=1 runs a separate instance alongside the
+// real one (own profile, so no single-instance clash), ORACLE_NO_VOICE=1
+// starts the backend without the microphone, ORACLE_OPEN_CHAT=1 opens the
+// chat window at start.
+if (process.env.ORACLE_DEV_PROFILE) {
+  app.setPath('userData', path.join(app.getPath('temp'), `oracle-dev-${process.pid}`));
+}
 
 // A second launch (e.g. the Ctrl+Alt+O shortcut while running) just talks.
 if (!app.requestSingleInstanceLock()) {
@@ -71,6 +80,8 @@ function startBackend() {
   const cmd = exe || process.env.ORACLE_PYTHON || 'python';
   // The backend polls our PID and exits when we're gone, crash included.
   const args = (exe ? [] : [path.join(root, 'oracle_server.py')]).concat('--parent-pid', String(process.pid));
+  if (process.env.ORACLE_NO_VOICE) args.push('--no-voice');
+  if (process.env.ORACLE_DEV_PROFILE) args.push('--no-background');  // the real instance does these
 
   backend = spawn(cmd, args, {
     cwd: root,
@@ -133,6 +144,60 @@ function createOrb() {
   orb.loadFile(path.join(__dirname, 'orb.html'));
 }
 
+// ---- chat window (../index.html; README 4.3 "chat window moved to Electron") ----
+// Created on first use and hidden, not destroyed, on close, so reopening it
+// is instant and keeps the conversation on screen.
+let chat = null;
+
+function openChat() {
+  if (!chat || chat.isDestroyed()) {
+    chat = new BrowserWindow({
+      width: 1100,
+      height: 760,
+      minWidth: 720,
+      minHeight: 480,
+      frame: false,               // the page draws its own title bar
+      backgroundColor: '#060a10',
+      title: 'ORACLE',
+      show: false,
+      icon: path.join(__dirname, '..', 'jarvis.ico'),
+      webPreferences: {
+        preload: path.join(__dirname, 'chat_preload.js'),
+        contextIsolation: true,
+        sandbox: true,
+      },
+    });
+    chat.on('close', (e) => {
+      if (!quitting) {
+        e.preventDefault();
+        chat.hide();
+      }
+    });
+    chat.webContents.on('console-message', (event) => console.log('[chat]', event.message));
+    chat.loadFile(path.join(__dirname, '..', 'index.html'));
+    chat.once('ready-to-show', () => { chat.show(); chat.focus(); });
+    return;
+  }
+  if (chat.isMinimized()) chat.restore();
+  chat.show();
+  chat.focus();
+}
+
+ipcMain.on('open-chat', () => openChat());
+ipcMain.on('chat-window', (_e, action) => {
+  if (!chat || chat.isDestroyed()) return;
+  if (action === 'minimize') chat.minimize();
+  else if (action === 'maximize') (chat.isMaximized() ? chat.unmaximize() : chat.maximize());
+  else if (action === 'hide') chat.hide();
+});
+ipcMain.handle('choose-folder', async () => {
+  const result = await dialog.showOpenDialog(chat && !chat.isDestroyed() ? chat : undefined, {
+    title: 'Choose your projects folder',
+    properties: ['openDirectory'],
+  });
+  return result.canceled ? null : result.filePaths[0];
+});
+
 function sendToBackend(msg) {
   if (orb && !orb.isDestroyed()) orb.webContents.send('command', msg);
 }
@@ -162,6 +227,7 @@ function refreshTray() {
   tray.setToolTip(muted ? 'ORACLE - microphone muted' : 'ORACLE - listening for you');
   tray.setContextMenu(Menu.buildFromTemplate([
     { label: 'Talk to ORACLE', accelerator: TALK_HOTKEYS[0], enabled: !muted, click: () => sendToBackend({ type: 'talk' }) },
+    { label: 'Open chat', accelerator: CHAT_HOTKEY, click: () => openChat() },
     { label: 'Mute microphone', type: 'checkbox', checked: muted, accelerator: MUTE_HOTKEY, click: () => sendToBackend({ type: 'mute', value: !muted }) },
     { label: 'Learn my voice…', enabled: !muted, click: () => sendToBackend({ type: 'enroll' }) },
     { type: 'separator' },
@@ -244,6 +310,7 @@ app.whenReady().then(async () => {
   if (app.isPackaged) app.setLoginItemSettings({ openAtLogin: true });
 
   createOrb();
+  if (process.env.ORACLE_OPEN_CHAT) openChat();
   if (process.env.ORACLE_ORB_SELFTEST) {
     // Puts up a fake confirmation (its reply is ignored by the backend) and
     // logs the window's clickable state, for testing the Yes/No hit-testing.
@@ -275,6 +342,9 @@ app.whenReady().then(async () => {
   // registration fails and the second-instance handler covers it instead.
   for (const key of TALK_HOTKEYS) globalShortcut.register(key, () => sendToBackend({ type: 'talk' }));
   globalShortcut.register(MUTE_HOTKEY, () => sendToBackend({ type: 'mute', value: !muted }));
+  if (!globalShortcut.register(CHAT_HOTKEY, () => openChat())) {
+    console.error(`${CHAT_HOTKEY} is taken by another app; open the chat from the tray instead.`);
+  }
 });
 
 // Closing the orb never quits ORACLE; Quit is in the tray.
