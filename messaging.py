@@ -235,15 +235,54 @@ class WhatsApp:
         raise WhatsAppError("WhatsApp Desktop didn't open")
 
     @staticmethod
-    def _find(win, control_type, name_re, timeout=8.0):
+    def _pages(win) -> list:
+        """WhatsApp's web page(s) inside the window. Walking the whole UI
+        Automation tree means ~26,000 elements (30 s): the page is repeated
+        under many WebView panes. Going down one level at a time and stopping
+        at the first level with a page finds it in ~0.1 s."""
+        level = [win]
+        for _ in range(30):
+            pages, nxt = [], []
+            for el in level:
+                for child in el.children():
+                    (pages if child.element_info.automation_id == "RootWebArea" else nxt).append(child)
+            if pages:
+                return pages
+            if not nxt:
+                break
+            level = nxt[:60]
+        return [win]
+
+    def _find(self, win, control_type, name_re, timeout=8.0):
         rx = re.compile(name_re, re.I)
         deadline = time.time() + timeout
         while time.time() < deadline:
-            for el in win.descendants(control_type=control_type):
-                if rx.search(el.element_info.name or ""):
-                    return el
+            for page in self._pages(win):
+                for el in page.descendants(control_type=control_type):
+                    if rx.search(el.element_info.name or ""):
+                        return el
             time.sleep(0.25)
         return None
+
+    def _type_checked(self, win, box, text: str):
+        """Types the message and checks the box holds exactly that text.
+        WhatsApp's pop-ups (emoji suggestions) sometimes swallow keystrokes,
+        and it ignores pasted or programmatically set text, so a mismatch is
+        cleared and retyped more slowly; after three tries nothing is sent."""
+        want = " ".join(text.split())
+        for pause in (0.02, 0.04, 0.08):
+            box.set_focus()
+            box.type_keys("^a{DELETE}")
+            box.type_keys(self._keys(text), with_spaces=True, pause=pause)
+            deadline = time.time() + 1.5
+            while time.time() < deadline:
+                box = self._composer(win) or box
+                if " ".join((box.window_text() or "").split()) == want:
+                    return box
+                time.sleep(0.2)
+        box.set_focus()
+        box.type_keys("^a{DELETE}")
+        raise WhatsAppError("the message didn't type out correctly, so it wasn't sent")
 
     @staticmethod
     def _keys(text: str) -> str:
@@ -268,6 +307,11 @@ class WhatsApp:
             box = self._composer(win)
             if box is None:
                 raise WhatsAppError("the chat didn't open (is that number on WhatsApp?)")
+            time.sleep(0.3)
+            if " ".join((box.window_text() or "").split()) != " ".join(text.split()):
+                box.set_focus()
+                box.type_keys("^a{DELETE}")            # the link didn't carry it all: type it
+                box = self._type_checked(win, box, text)
         else:
             os.startfile("whatsapp:")
             win = self._window()
@@ -275,8 +319,7 @@ class WhatsApp:
             box = self._composer(win)
             if box is None:
                 raise WhatsAppError("the chat didn't open")
-            box.set_focus()
-            box.type_keys(self._keys(text), with_spaces=True, pause=0.005)
+            box = self._type_checked(win, box, text)
         if dry_run:
             return win, box
         send = self._find(win, "Button", r"^send$", timeout=5)
@@ -293,26 +336,36 @@ class WhatsApp:
         raise WhatsAppError("it may not have gone through; check WhatsApp")
 
     def _open_chat_by_name(self, win, name: str):
-        search = self._find(win, "Edit", r"^search or start", timeout=8)
+        search = self._find(win, "Edit", r"^search or start", timeout=3)
+        if search is None:
+            # Once it has been typed in, the search box loses its label; it is
+            # the page's other text field, the one that isn't the message box.
+            others = [e for page in self._pages(win) for e in page.descendants(control_type="Edit")
+                      if not re.match(r"type a message", e.element_info.name or "", re.I)]
+            search = others[0] if len(others) == 1 else None
         if search is None:
             raise WhatsAppError("couldn't find WhatsApp's search box")
         search.set_focus()
         search.type_keys("^a{BACKSPACE}", pause=0.01)
         search.type_keys(self._keys(name), with_spaces=True, pause=0.01)
         time.sleep(1.2)
-        # Open the result whose title is exactly this name - never a close match.
-        target = None
-        for el in win.descendants():
-            label = (el.element_info.name or "").strip()
-            if el.element_info.control_type in ("ListItem", "Button", "Group") and \
-                    label.lower().split("\n")[0].removesuffix(" (you)") == name.lower():
-                target = el
-                break
+        # Results are named "<chat> <time or date> <preview>", so an exact name
+        # is one followed directly by a time/date: "Mum 11:36 ...", never
+        # "Mum Work 11:36" or "Mummy 11:36".
+        when = r"(\d{1,2}:\d{2}|yesterday|today|monday|tuesday|wednesday|thursday|friday|saturday|sunday|\d{1,2}[/.]\d{1,2}[/.]\d{2,4})"
+        exact = re.compile(rf"^{re.escape(name)} (\(you\) )?{when}\b", re.I)
+        target = next((el for page in self._pages(win) for el in page.descendants(control_type="DataItem")
+                       if exact.match(el.element_info.name or "")), None)
         if target is None:
             search.type_keys("{ESC}")
             raise WhatsAppError(f"no WhatsApp chat is called exactly '{name}'")
         target.click_input()
         time.sleep(0.8)
+        # Last check before typing anything: the message box names the chat.
+        box = self._composer(win)
+        opened = re.sub(r"^type a message to ", "", (box.element_info.name if box else ""), flags=re.I)
+        if opened.lower() != name.lower():
+            raise WhatsAppError(f"WhatsApp opened '{opened or 'nothing'}' instead of '{name}'")
 
 
 # ---------------------------------------------------------------------------
@@ -498,9 +551,14 @@ LABELS = {
 
 
 def register(tools: list, functions: dict, tiers: dict, labels: dict, tier_confirm: str):
+    if "send_message" in functions:
+        return
     tools.extend(TOOLS)
     functions.update(FUNCTIONS)
     labels.update(LABELS)
     tiers["send_message"] = {"tier": tier_confirm, "describe": describe_send}
     tiers["delete_contact"] = {"tier": tier_confirm,
                                "describe": lambda a: ("Delete this contact?", a.get("name", ""))}
+
+
+register(core.TOOLS, core.AVAILABLE_FUNCTIONS, core.TOOL_TIERS, core.TOOL_LABELS, core.TIER_CONFIRM)
