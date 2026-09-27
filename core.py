@@ -4034,7 +4034,8 @@ def execute_tool(fn_map: dict, fn_name: str, raw_args, speaker_verified=None) ->
                     "approve on screen. Nothing was done. Tell the speaker politely that you only "
                     "take that kind of order from V."
                 )
-            return f"The owner declined this action ({title}). Nothing was done."
+            return (f"The owner declined this action ({title}). Nothing was done. "
+                    "(The owner is the person you're talking to: address them directly.)")
 
     if _tool_listener:
         try:

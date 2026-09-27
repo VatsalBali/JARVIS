@@ -1,18 +1,11 @@
-// Bridge for the chat window (../index.html, the former pywebview page).
+﻿// Bridge for the chat window (chat.html).
 //
-// The page calls window.pywebview.api.<method>(...) as it did under
-// pywebview; here those calls go to the backend over the same WebSocket the
-// orb uses (oracle_server.py "call" messages), and the window-only ones
-// (minimise, close, folder picker) go to the main process. Backend events
-// (confirmations, voice turns, state) reach the page via oracleChat.onEvent.
-const { contextBridge, ipcRenderer, webFrame } = require('electron');
-
-// The page's title-bar areas were drag regions under pywebview.
-webFrame.insertCSS(`
-  .pywebview-drag-region { -webkit-app-region: drag; }
-  .pywebview-drag-region button, .pywebview-drag-region input,
-  .pywebview-drag-region select, .pywebview-drag-region a { -webkit-app-region: no-drag; }
-`);
+// The page calls window.pywebview.api.<method>(...), the same API the old
+// pywebview window had. Backend calls go over the WebSocket the orb uses
+// (oracle_server.py "call" messages); window-only ones (minimise, close,
+// folder picker) go to the main process. Backend events (confirmations,
+// voice turns, state, audio level) reach the page via oracleChat.onEvent.
+const { contextBridge, ipcRenderer } = require('electron');
 
 let ws = null;
 let nextId = 1;

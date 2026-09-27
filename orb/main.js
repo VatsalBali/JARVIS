@@ -144,7 +144,7 @@ function createOrb() {
   orb.loadFile(path.join(__dirname, 'orb.html'));
 }
 
-// ---- chat window (../index.html; README 4.3 "chat window moved to Electron") ----
+// ---- chat window (chat.html; README 4.3 "chat window moved to Electron") ----
 // Created on first use and hidden, not destroyed, on close, so reopening it
 // is instant and keeps the conversation on screen.
 let chat = null;
@@ -157,7 +157,7 @@ function openChat() {
       minWidth: 720,
       minHeight: 480,
       frame: false,               // the page draws its own title bar
-      backgroundColor: '#060a10',
+      backgroundColor: '#0b0703',
       title: 'ORACLE',
       show: false,
       icon: path.join(__dirname, '..', 'jarvis.ico'),
@@ -174,7 +174,7 @@ function openChat() {
       }
     });
     chat.webContents.on('console-message', (event) => console.log('[chat]', event.message));
-    chat.loadFile(path.join(__dirname, '..', 'index.html'));
+    chat.loadFile(path.join(__dirname, 'chat.html'));
     chat.once('ready-to-show', () => { chat.show(); chat.focus(); });
     return;
   }

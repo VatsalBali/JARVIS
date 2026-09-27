@@ -1247,45 +1247,6 @@
   document.getElementById('closeBtn').addEventListener('click', async () => {
     try { await window.pywebview.api.hide_window(); } catch (err) { console.error(err); }
   });
-
-  // ---- Live backend events (Electron chat window, orb/chat_preload.js) ----
-  // Under pywebview, Python pushed these via evaluate_js instead.
-  function settleConfirm(id, ok, reason) {
-    const card = log.querySelector(`[data-confirm-id="${CSS.escape(id)}"]`);
-    if (!card) return;
-    const actions = card.querySelector('.confirm-actions');
-    if (!actions.querySelector('button')) return;   // already answered here
-    const status = document.createElement('span');
-    status.className = 'confirm-status';
-    status.textContent = reason === 'timeout' ? 'No answer, so nothing was done.'
-      : (ok ? 'Approved' : 'Declined') + (reason === 'spoken' ? ' by voice.' : '.');
-    actions.innerHTML = '';
-    actions.appendChild(status);
-  }
-
-  if (window.oracleChat) {
-    const RING_LABELS = { listening: 'Listening…', thinking: 'Thinking…', speaking: 'Speaking…' };
-    window.oracleChat.onEvent((ev) => {
-      switch (ev.type) {
-        case 'confirm':
-          showConfirm({ id: ev.id, title: ev.action, details: ev.details, tier: ev.tier });
-          break;
-        case 'confirm_closed':
-          settleConfirm(ev.id, ev.ok, ev.reason);
-          break;
-        case 'turn':
-          // A finished voice exchange: show it here too, as part of this chat.
-          if (ev.user) addMessage('user', ev.user);
-          if (ev.reply) addMessage('jarvis', ev.reply);
-          refreshChatList();
-          break;
-        case 'state':
-          setRingThinking(ev.state === 'thinking');
-          setRingStatus(RING_LABELS[ev.state] || 'Online');
-          break;
-      }
-    });
-  }
 </script>
 
 </body>
