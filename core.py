@@ -42,9 +42,67 @@ import contextlib
 import re
 from pathlib import Path
 from datetime import datetime, timedelta
+from concurrent.futures import ThreadPoolExecutor
+
+class _SharedCAAdapter(requests.adapters.HTTPAdapter):
+    """requests (2.32.5) re-reads certifi's CA bundle for every new HTTPS
+    connection, and on this machine that read takes ~1.5 s (measured; the
+    handshake itself is 0.1 s). This loads the bundle once, in the
+    background at startup, into one SSL context that every connection
+    shares. Certificates are still verified; a request made before the
+    load finishes waits for it."""
+
+    _ctx = None
+    _loaded = threading.Event()
+
+    @classmethod
+    def _load(cls):
+        try:
+            import certifi
+            cls._ctx.load_verify_locations(certifi.where())
+        finally:
+            cls._loaded.set()
+
+    def init_poolmanager(self, *args, **kwargs):
+        if _SharedCAAdapter._ctx is None:
+            from urllib3.util.ssl_ import create_urllib3_context
+            _SharedCAAdapter._ctx = create_urllib3_context()
+            threading.Thread(target=_SharedCAAdapter._load, daemon=True, name="ca-bundle").start()
+        kwargs["ssl_context"] = _SharedCAAdapter._ctx
+        super().init_poolmanager(*args, **kwargs)
+
+    def cert_verify(self, conn, url, verify, cert):
+        super().cert_verify(conn, url, verify, cert)
+        if verify is True and url.lower().startswith("https"):
+            self._loaded.wait(30)
+            conn.ca_certs = None   # already in the shared context; don't re-read the file
+
+
+# One shared HTTPS session for every web API ORACLE calls: reused connections
+# take ~0.1 s, where a fresh connection per request made listing 10 emails
+# take 24 s (measured).
+_http = requests.Session()
+_http.mount("https://", _SharedCAAdapter(pool_connections=8, pool_maxsize=16))
 
 MODEL = "openai/gpt-oss-120b"
+# Groq's free tier allows 8,000 tokens a minute per model and each request
+# with the tool list is ~3,000, so a few messages in quick succession hit the
+# cap; the SDK then silently waits and retries (8-24 s measured). Instead,
+# switch straight to the smaller model, which has its own separate allowance.
+FALLBACK_MODEL = "openai/gpt-oss-20b"
 client = Groq(api_key=os.environ.get("GROQ_API_KEY"))
+
+
+def _chat(**kwargs):
+    """client.chat.completions.create with MODEL, falling back to
+    FALLBACK_MODEL (then to waiting) when the per-minute limit is hit."""
+    from groq import RateLimitError
+    for model in (MODEL, FALLBACK_MODEL):
+        try:
+            return client.with_options(max_retries=0).chat.completions.create(model=model, **kwargs)
+        except RateLimitError:
+            print(f"Groq: {model} is at its per-minute limit; trying the next model.")
+    return client.chat.completions.create(model=MODEL, **kwargs)   # both busy: wait and retry
 
 SYSTEM_PROMPT = (
     "You are ORACLE, a personal AI assistant in the spirit of JARVIS from Iron Man: "
@@ -1836,7 +1894,7 @@ _WMO = {
 
 def _geocode(location: str):
     parts = [p.strip() for p in location.split(",") if p.strip()]
-    resp = requests.get(
+    resp = _http.get(
         "https://geocoding-api.open-meteo.com/v1/search",
         params={"name": parts[0], "count": 10, "language": "en", "format": "json"}, timeout=10,
     )
@@ -1903,7 +1961,7 @@ def get_weather(location: str = "", days: int = 1) -> str:
         if not place:
             return f"Couldn't find a place called '{location}'."
         days = max(1, min(7, int(days or 1)))
-        resp = requests.get("https://api.open-meteo.com/v1/forecast", params={
+        resp = _http.get("https://api.open-meteo.com/v1/forecast", params={
             "latitude": place["latitude"], "longitude": place["longitude"], "timezone": "auto",
             "current": "temperature_2m,apparent_temperature,weather_code,wind_speed_10m,relative_humidity_2m,precipitation",
             "daily": "weather_code,temperature_2m_max,temperature_2m_min,precipitation_probability_max",
@@ -1993,10 +2051,8 @@ def _brief_gmail() -> str:
     if not n:
         return "Gmail: no new mail since yesterday."
     items = []
-    for m in messages[:3]:
-        meta = _gmail_request("GET", f"/users/me/messages/{m['id']}",
-                              params={"format": "metadata", "metadataHeaders": ["From", "Subject"]})
-        headers = {h["name"]: h["value"] for h in meta.json().get("payload", {}).get("headers", [])}
+    for meta in _gmail_metadata([m["id"] for m in messages[:3]], ("From", "Subject")):
+        headers = {h["name"]: h["value"] for h in (meta or {}).get("payload", {}).get("headers", [])}
         sender = re.sub(r"\s*<[^>]+>", "", headers.get("From", "?")).strip('" ')
         items.append(f"- {sender}: {headers.get('Subject', '(no subject)')}")
     count = "50+" if n >= 50 else str(n)
@@ -2033,7 +2089,7 @@ def _brief_news() -> str:
     for url in feeds:
         titles = []
         try:
-            resp = requests.get(url, timeout=8, headers={"User-Agent": "ORACLE/1.0"})
+            resp = _http.get(url, timeout=8, headers={"User-Agent": "ORACLE/1.0"})
             resp.raise_for_status()
             for item in ET.fromstring(resp.content).iter("item"):
                 title = (item.findtext("title") or "").strip()
@@ -2579,7 +2635,7 @@ def _graph_request(method: str, path: str, json_body: dict = None) -> requests.R
     and the base URL so individual tools below don't repeat that setup."""
     token = _get_graph_token()
     headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
-    return requests.request(method, f"{GRAPH_BASE}{path}", headers=headers, json=json_body, timeout=15)
+    return _http.request(method, f"{GRAPH_BASE}{path}", headers=headers, json=json_body, timeout=15)
 
 
 def list_recent_emails(count: int = 10) -> str:
@@ -2747,6 +2803,8 @@ GMAIL_SCOPES = [
 GMAIL_BASE = "https://gmail.googleapis.com/gmail/v1"
 
 _gmail_creds = None
+_gmail_saved_token = None
+_gmail_lock = threading.Lock()
 
 
 def _get_gmail_token_path() -> str:
@@ -2757,7 +2815,12 @@ def _get_gmail_token() -> str:
     """Same shape as _get_graph_token for Outlook: load a cached session
     if there is one, refresh it silently if it's expired, and only open a
     browser for a fresh login if there's no usable cached session at all."""
-    global _gmail_creds
+    with _gmail_lock:   # list_gmail_messages calls this from several threads
+        return _get_gmail_token_locked()
+
+
+def _get_gmail_token_locked() -> str:
+    global _gmail_creds, _gmail_saved_token
 
     token_path = _get_gmail_token_path()
 
@@ -2785,8 +2848,10 @@ def _get_gmail_token() -> str:
         if _gmail_creds is None:
             raise RuntimeError("Gmail sign-in wasn't completed")
 
-    with open(token_path, "w") as f:
-        f.write(_gmail_creds.to_json())
+    if _gmail_creds.token != _gmail_saved_token:   # only after a refresh or sign-in
+        with open(token_path, "w") as f:
+            f.write(_gmail_creds.to_json())
+        _gmail_saved_token = _gmail_creds.token
 
     return _gmail_creds.token
 
@@ -2794,7 +2859,25 @@ def _get_gmail_token() -> str:
 def _gmail_request(method: str, path: str, params: dict = None, json_body: dict = None) -> requests.Response:
     token = _get_gmail_token()
     headers = {"Authorization": f"Bearer {token}"}
-    return requests.request(method, f"{GMAIL_BASE}{path}", headers=headers, params=params, json=json_body, timeout=15)
+    return _http.request(method, f"{GMAIL_BASE}{path}", headers=headers, params=params, json=json_body, timeout=15)
+
+
+def _gmail_metadata(ids, headers=("Subject", "From", "Date")) -> list:
+    """Metadata for several messages, fetched in parallel (Gmail's list
+    endpoint only returns IDs). Same order as ids; None where a fetch failed."""
+    _get_gmail_token()   # refresh (or fail) once, before the threads start
+
+    def one(msg_id):
+        try:
+            r = _gmail_request("GET", f"/users/me/messages/{msg_id}",
+                               params={"format": "metadata", "metadataHeaders": list(headers)})
+            r.raise_for_status()
+            return r.json()
+        except Exception:
+            return None
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        return list(pool.map(one, ids))
 
 
 def _b64url_decode(data: str) -> str:
@@ -2827,9 +2910,9 @@ def _extract_gmail_body(payload: dict) -> str:
 
 
 def list_gmail_messages(count: int = 10) -> str:
-    """Lists the most recent Gmail messages. Slower than Outlook's
-    equivalent by design - Gmail's list endpoint only returns IDs, so
-    this makes one follow-up request per message to get subject/sender."""
+    """Lists the most recent Gmail messages. Gmail's list endpoint only
+    returns IDs, so subject/sender come from one follow-up request per
+    message, made in parallel."""
     try:
         resp = _gmail_request("GET", "/users/me/messages", params={"maxResults": count})
         resp.raise_for_status()
@@ -2841,17 +2924,9 @@ def list_gmail_messages(count: int = 10) -> str:
         return "No messages found."
 
     lines = []
-    for msg_id in ids:
-        try:
-            detail_resp = _gmail_request(
-                "GET", f"/users/me/messages/{msg_id}",
-                params={"format": "metadata", "metadataHeaders": ["Subject", "From", "Date"]},
-            )
-            detail_resp.raise_for_status()
-            detail = detail_resp.json()
-        except Exception:
+    for msg_id, detail in zip(ids, _gmail_metadata(ids)):
+        if detail is None:
             continue
-
         headers = {h["name"]: h["value"] for h in detail.get("payload", {}).get("headers", [])}
         lines.append(
             f"ID: {msg_id}\nFrom: {headers.get('From', 'unknown')}\n"
@@ -4095,11 +4170,7 @@ def run_conversation(user_input: str, history: list, conversation_id: int = None
     save_message(user_msg, conversation_id)
 
     for _ in range(MAX_TOOL_ROUNDS):
-        response = client.chat.completions.create(
-            model=MODEL,
-            messages=history,
-            tools=active_tools(),
-        )
+        response = _chat(messages=history, tools=active_tools())
 
         message = response.choices[0].message
 
@@ -4171,13 +4242,10 @@ def generate_wake_greeting() -> str:
         "each time rather than repeating a fixed template - not a generic "
         "'How can I help you today?'"
     )
-    response = client.chat.completions.create(
-        model=MODEL,
-        messages=[
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": prompt},
-        ],
-    )
+    response = _chat(messages=[
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "user", "content": prompt},
+    ])
     return response.choices[0].message.content
 
 

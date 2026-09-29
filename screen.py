@@ -25,7 +25,7 @@ import psutil
 import core
 
 BROWSERS = {"chrome", "msedge", "brave", "firefox", "opera", "vivaldi", "arc"}
-VISION_MODELS = ["gemini-3.8-flash", "gemini-flash-latest", "gemini-2.5-flash"]
+VISION_MODELS = ["gemini-3.8-flash", "gemini-flash-latest"]
 _user32 = ctypes.windll.user32
 
 try:   # real pixels for window rectangles on scaled (125% etc.) displays
@@ -217,7 +217,7 @@ def look_at_screen(question: str = "", target: str = "window") -> str:
         automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True),
         thinking_config=types.ThinkingConfig(thinking_budget=0),
     )
-    last_error = None
+    first_error = None
     for model in VISION_MODELS:
         try:
             resp = gemini_voice._client.models.generate_content(
@@ -229,8 +229,8 @@ def look_at_screen(question: str = "", target: str = "window") -> str:
             if text:
                 return f"(Looked at {where}.) {text}"
         except Exception as e:
-            last_error = e
-    return f"Error: couldn't analyse the screenshot ({last_error})."
+            first_error = first_error or e   # the main model's error says the most
+    return f"Error: couldn't analyse the screenshot ({first_error})."
 
 
 # ---------------------------------------------------------------------------
