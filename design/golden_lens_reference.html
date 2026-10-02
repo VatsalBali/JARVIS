@@ -1,0 +1,163 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Golden Lens presence</title>
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Chakra+Petch:wght@400;600&family=IBM+Plex+Mono:wght@400&display=swap" rel="stylesheet">
+<style>
+body{margin:0}
+</style>
+</helmet>
+<div style="width: 1280px; height: 720px; position: relative; overflow: hidden; background: radial-gradient(ellipse at 50% 50%, #1f1307 0%, #0b0703 55%, #050302 100%); font-family: 'Chakra Petch', sans-serif; color: #fff1d6">
+<svg width="1280" height="720" viewBox="-640 -360 1280 720" aria-hidden="true" style="position: absolute; left: 0; top: 0">
+<defs>
+<filter id="bloom" filterUnits="userSpaceOnUse" x="-640" y="-360" width="1280" height="720">
+<feGaussianBlur stdDeviation="3.5" result="b"></feGaussianBlur>
+<feMerge><feMergeNode in="b"></feMergeNode><feMergeNode in="SourceGraphic"></feMergeNode></feMerge>
+</filter>
+<radialGradient id="haze" cx="0" cy="0" r="300" gradientUnits="userSpaceOnUse">
+<stop offset="0" stop-color="{{gold}}" stop-opacity="0.55"></stop>
+<stop offset="0.4" stop-color="{{amber}}" stop-opacity="0.15"></stop>
+<stop offset="1" stop-color="{{amber}}" stop-opacity="0"></stop>
+</radialGradient>
+</defs>
+
+<circle r="300" fill="url(#haze)" opacity="{{glowOp}}"></circle>
+
+<g filter="url(#bloom)">
+
+<g opacity="{{circuitOp}}">
+<path d="{{spokes}}" fill="none" stroke="{{gold}}" stroke-opacity="0.35" stroke-width="1"></path>
+<path d="M0 -360 L0 360" stroke="{{gold}}" stroke-opacity="0.5" stroke-width="1.4"></path>
+<path d="{{traces}}" fill="none" stroke="{{gold}}" stroke-opacity="0.8" stroke-width="1.3" stroke-linejoin="round"></path>
+<path d="{{pads}}" fill="{{gold}}"></path>
+</g>
+
+<g opacity="{{ringOp}}">
+<g transform="rotate(-7)">
+<g transform="scale(1,0.46)">
+<circle r="560" fill="none" stroke="{{amber}}" stroke-opacity="0.35" stroke-width="1"></circle>
+<g>
+<animateTransform attributeName="transform" type="rotate" from="0" to="360" dur="{{durA}}" repeatCount="indefinite"></animateTransform>
+<circle r="500" fill="none" stroke="{{gold}}" stroke-opacity="0.7" stroke-width="2.5" stroke-dasharray="260 60 40 90 140 70"></circle>
+</g>
+<g>
+<animateTransform attributeName="transform" type="rotate" from="360" to="0" dur="{{durB}}" repeatCount="indefinite"></animateTransform>
+<circle r="420" fill="none" stroke="{{gold}}" stroke-opacity="0.55" stroke-width="10" stroke-dasharray="1.5 9"></circle>
+</g>
+<circle r="360" fill="none" stroke="{{gold}}" stroke-opacity="0.4" stroke-width="1.2"></circle>
+<g>
+<animateTransform attributeName="transform" type="rotate" from="0" to="360" dur="{{durC}}" repeatCount="indefinite"></animateTransform>
+<circle r="290" fill="none" stroke="{{hot}}" stroke-opacity="0.8" stroke-width="2" stroke-dasharray="120 50 20 50" stroke-linecap="round"></circle>
+</g>
+<circle r="220" fill="none" stroke="{{gold}}" stroke-opacity="0.5" stroke-width="1"></circle>
+<circle r="160" fill="none" stroke="{{amber}}" stroke-opacity="0.6" stroke-width="6" stroke-dasharray="3 5"></circle>
+</g>
+</g>
+<g transform="rotate(62)">
+<g transform="scale(1,0.28)">
+<g>
+<animateTransform attributeName="transform" type="rotate" from="0" to="360" dur="{{durB}}" repeatCount="indefinite"></animateTransform>
+<circle r="330" fill="none" stroke="{{gold}}" stroke-opacity="0.45" stroke-width="1.5" stroke-dasharray="200 40 10 40"></circle>
+</g>
+</g>
+</g>
+<g transform="rotate(-58)">
+<g transform="scale(1,0.22)">
+<circle r="380" fill="none" stroke="{{gold}}" stroke-opacity="0.3" stroke-width="1"></circle>
+</g>
+</g>
+</g>
+
+<g opacity="{{sparkOp}}">
+<path d="{{sparksA}}" fill="{{hot}}">
+<animate attributeName="opacity" values="0.25;1;0.25" dur="2.4s" repeatCount="indefinite"></animate>
+</path>
+<path d="{{sparksB}}" fill="{{gold}}">
+<animate attributeName="opacity" values="1;0.2;1" dur="3.1s" repeatCount="indefinite"></animate>
+</path>
+<path d="{{sparksC}}" fill="{{amber}}">
+<animate attributeName="opacity" values="0.4;0.9;0.4" dur="1.7s" repeatCount="indefinite"></animate>
+</path>
+</g>
+
+<g transform="scale({{coreScale}})">
+<g>
+<animateTransform attributeName="transform" type="scale" values="1;{{pulse}};1" dur="{{pulseDur}}" repeatCount="indefinite"></animateTransform>
+<circle r="58" fill="none" stroke="{{gold}}" stroke-opacity="0.55" stroke-width="1.5"></circle>
+<circle r="38" fill="none" stroke="{{hot}}" stroke-width="8"></circle>
+<circle r="38" fill="none" stroke="{{gold}}" stroke-width="16" stroke-opacity="0.3"></circle>
+<circle r="22" fill="#130a03"></circle>
+<circle r="10" fill="{{gold}}" fill-opacity="0.35"></circle>
+</g>
+</g>
+
+</g>
+</svg>
+<div style="position: absolute; left: 0; right: 0; bottom: 56px; display: flex; flex-direction: column; align-items: center; gap: 10px">
+<div style="font-size: 13px; letter-spacing: 6px; color: {{gold}}; font-weight: 600">{{label}}</div>
+<div style="font-family: 'IBM Plex Mono', monospace; font-size: 20px; color: #fff1d6; text-shadow: 0 0 12px #000">{{text}}</div>
+</div>
+</div>
+</x-dc>
+<script type="text/x-dc" data-dc-script data-props='{"mode":{"editor":"enum","options":["asleep","wake","listening","thinking","speaking"],"default":"listening"},"gold":{"editor":"color","default":"#ffb838","section":"Colour"},"amber":{"editor":"color","default":"#ff8a1e","section":"Colour"},"$preview":{"width":1280,"height":720}}'>
+class Component extends DCLogic {
+rnd(i) { const x = Math.sin(i * 12.9898 + 78.233) * 43758.5453; return x - Math.floor(x); }
+dots(start, n, spread) {
+let d = '';
+for (let i = start; i < start + n; i++) {
+const a = this.rnd(i) * Math.PI * 2;
+const ring = [160, 220, 290, 360, 420, 500][Math.floor(this.rnd(i + 900) * 6)];
+const rr = ring + (this.rnd(i + 300) - 0.5) * spread;
+const tilt = -7 * Math.PI / 180;
+let x = rr * Math.cos(a), y = rr * Math.sin(a) * 0.46;
+const xr = x * Math.cos(tilt) - y * Math.sin(tilt), yr = x * Math.sin(tilt) + y * Math.cos(tilt);
+const r = 0.8 + this.rnd(i + 600) * 2.6;
+d += 'M' + (xr - r).toFixed(1) + ' ' + yr.toFixed(1) + 'a' + r.toFixed(1) + ' ' + r.toFixed(1) + ' 0 1 0 ' + (2 * r).toFixed(1) + ' 0a' + r.toFixed(1) + ' ' + r.toFixed(1) + ' 0 1 0 ' + (-2 * r).toFixed(1) + ' 0';
+}
+return d;
+}
+geometry() {
+if (this._geo) return this._geo;
+let spokes = '';
+for (let i = 0; i < 26; i++) {
+const a = (i / 26) * Math.PI * 2 + this.rnd(i + 50) * 0.2;
+const r0 = 70 + this.rnd(i + 70) * 60, r1 = 380 + this.rnd(i + 90) * 380;
+spokes += 'M' + (r0 * Math.cos(a)).toFixed(1) + ' ' + (r0 * Math.sin(a) * 0.62).toFixed(1) + 'L' + (r1 * Math.cos(a)).toFixed(1) + ' ' + (r1 * Math.sin(a) * 0.62).toFixed(1);
+}
+let traces = '', pads = '';
+for (let i = 0; i < 46; i++) {
+const a = this.rnd(i + 200) * Math.PI * 2;
+const r = 240 + this.rnd(i + 230) * 330;
+let x = r * Math.cos(a), y = r * Math.sin(a) * 0.5;
+const dir = Math.cos(a) > 0 ? 1 : -1;
+const h1 = 14 + this.rnd(i + 260) * 50, dg = 8 + this.rnd(i + 290) * 26, h2 = 10 + this.rnd(i + 320) * 40;
+const up = this.rnd(i + 350) > 0.5 ? 1 : -1;
+const x1 = x + dir * h1, x2 = x1 + dir * dg, y2 = y + up * dg, x3 = x2 + dir * h2;
+traces += 'M' + x.toFixed(1) + ' ' + y.toFixed(1) + 'L' + x1.toFixed(1) + ' ' + y.toFixed(1) + 'L' + x2.toFixed(1) + ' ' + y2.toFixed(1) + 'L' + x3.toFixed(1) + ' ' + y2.toFixed(1);
+pads += 'M' + (x3 - 2).toFixed(1) + ' ' + (y2 - 2).toFixed(1) + 'h4v4h-4z';
+}
+this._geo = { spokes, traces, pads, sparksA: this.dots(0, 70, 40), sparksB: this.dots(70, 80, 70), sparksC: this.dots(150, 90, 120) };
+return this._geo;
+}
+renderVals() {
+const modes = {
+asleep:    { ringOp: 0.1,  sparkOp: 0,   circuitOp: 0.04, glowOp: 0.12, coreScale: 0.45, pulse: 1.02, pulseDur: '4s',   durA: '90s', durB: '70s', durC: '60s', label: 'ASLEEP',    text: 'Say “Oracle”' },
+wake:      { ringOp: 1,    sparkOp: 1,   circuitOp: 0.9,  glowOp: 1,    coreScale: 1.1,  pulse: 1.08, pulseDur: '1.2s', durA: '40s', durB: '30s', durC: '20s', label: 'WAKE',      text: 'Yes?' },
+listening: { ringOp: 0.85, sparkOp: 0.7, circuitOp: 0.6,  glowOp: 0.8,  coreScale: 1,    pulse: 1.12, pulseDur: '0.7s', durA: '60s', durB: '45s', durC: '30s', label: 'LISTENING', text: '“Oracle, what’s on my calendar today?”' },
+thinking:  { ringOp: 0.75, sparkOp: 0.5, circuitOp: 1,    glowOp: 0.6,  coreScale: 0.9,  pulse: 1.03, pulseDur: '1.6s', durA: '8s',  durB: '6s',  durC: '3s',  label: 'THINKING',  text: 'Checking your calendar…' },
+speaking:  { ringOp: 1,    sparkOp: 1,   circuitOp: 0.8,  glowOp: 1,    coreScale: 1.05, pulse: 1.15, pulseDur: '0.45s', durA: '50s', durB: '38s', durC: '24s', label: 'SPEAKING',  text: 'Two meetings today. The first is at 10:30.' }
+};
+const m = modes[this.props.mode] || modes.listening;
+return Object.assign({ gold: this.props.gold ?? '#ffb838', amber: this.props.amber ?? '#ff8a1e', hot: '#fff3d1' }, this.geometry(), m);
+}
+}
+</script>
+</body>
+</html>

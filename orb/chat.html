@@ -1,0 +1,88 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta http-equiv="Content-Security-Policy"
+      content="default-src 'self'; style-src 'self'; font-src 'self'; img-src 'self' data:">
+<title>ORACLE</title>
+<link rel="stylesheet" href="node_modules/@fontsource/chakra-petch/600.css">
+<link rel="stylesheet" href="node_modules/@fontsource/ibm-plex-mono/400.css">
+<link rel="stylesheet" href="node_modules/@fontsource/ibm-plex-sans/400.css">
+<link rel="stylesheet" href="node_modules/@fontsource/ibm-plex-sans/500.css">
+<link rel="stylesheet" href="chat.css">
+</head>
+<body>
+  <header id="bar">
+    <button id="menuBtn" class="icon" type="button" title="Chats" aria-label="Chats">
+      <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M3 6h14M3 10h14M3 14h9"/></svg>
+    </button>
+    <div id="orbSlot" title="Talk (Ctrl+Alt+O)">
+      <canvas id="lens"></canvas>
+    </div>
+    <div id="winControls">
+      <button id="minBtn" class="icon" type="button" aria-label="Minimise">
+        <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M5 10h10"/></svg>
+      </button>
+      <button id="maxBtn" class="icon" type="button" aria-label="Maximise">
+        <svg viewBox="0 0 20 20" aria-hidden="true"><rect x="5.5" y="5.5" width="9" height="9"/></svg>
+      </button>
+      <button id="closeBtn" class="icon" type="button" aria-label="Close">
+        <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M6 6l8 8M14 6l-8 8"/></svg>
+      </button>
+    </div>
+  </header>
+  <div id="status">ONLINE</div>
+
+  <aside id="drawer" aria-label="Chats">
+    <div class="drawer-head">
+      <button id="newChatBtn" type="button">New chat</button>
+      <select id="agentSelect" aria-label="Mode">
+        <option value="main">Main</option>
+        <option value="coding">Coding</option>
+      </select>
+    </div>
+    <input id="searchChats" type="search" placeholder="Search chats" autocomplete="off">
+    <div class="drawer-label">CHATS</div>
+    <div id="chatList"></div>
+    <div class="drawer-label projects-label">
+      PROJECTS
+      <button id="projectsRootBtn" class="text-btn" type="button">Choose folder</button>
+    </div>
+    <div id="projectList"></div>
+  </aside>
+  <div id="scrim"></div>
+
+  <main id="main">
+    <section id="empty">
+      <h1 id="greeting">Good evening, Sir.</h1>
+      <p>Type anything you'd say out loud, or paste an address, a number or a name that's hard to spell.</p>
+      <div id="suggestions">
+        <button type="button" data-msg="Any new messages?">Any new messages?</button>
+        <button type="button" data-msg="What's the weather tomorrow?">Weather tomorrow</button>
+        <button type="button" data-msg="Show my contacts.">My contacts</button>
+      </div>
+    </section>
+    <div id="log" aria-live="polite"></div>
+  </main>
+
+  <footer id="composer">
+    <div id="inputWrap">
+      <span class="prompt" aria-hidden="true">›</span>
+      <textarea id="input" rows="1" placeholder="Type a message…" autocomplete="off"></textarea>
+      <button id="micBtn" class="icon" type="button" title="Dictate" aria-label="Dictate">
+        <svg viewBox="0 0 20 20" aria-hidden="true"><rect x="7.5" y="3" width="5" height="9" rx="2.5"/><path d="M5 10a5 5 0 0 0 10 0M10 15v2.5"/></svg>
+      </button>
+      <button id="sendBtn" class="icon send" type="button" title="Send" aria-label="Send">
+        <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M4 10h11M11 5.5 15.5 10 11 14.5"/></svg>
+      </button>
+    </div>
+    <div id="hint">Enter to send · Shift+Enter for a new line</div>
+  </footer>
+
+  <div id="menu" hidden></div>
+
+  <script src="lens.js"></script>
+  <script src="chat.js"></script>
+</body>
+</html>

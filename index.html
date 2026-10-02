@@ -416,6 +416,31 @@
     font-family: "Consolas", "SF Mono", monospace; font-size: 12px; color: var(--text); white-space: pre;
   }
 
+  /* ============ CONFIRMATION CARD (Confirm-tier tool calls) ============ */
+  .confirm-card {
+    border: 1px solid var(--accent-dim);
+    border-radius: 8px;
+    background: var(--panel-alt);
+    padding: 12px 14px;
+    margin-left: 30px;
+  }
+  .confirm-card.warn { border-color: var(--warn); }
+  .confirm-card .confirm-title { font-size: 13px; color: var(--accent); margin-bottom: 8px; }
+  .confirm-card.warn .confirm-title { color: var(--warn); }
+  .confirm-card .confirm-details {
+    font-family: "Consolas", "SF Mono", monospace; font-size: 12px; color: var(--text);
+    white-space: pre-wrap; word-break: break-word;
+    max-height: 260px; overflow-y: auto; margin: 0 0 10px;
+  }
+  .confirm-card .confirm-actions { display: flex; gap: 8px; }
+  .confirm-card button {
+    font: inherit; font-size: 12px; padding: 5px 16px; border-radius: 5px; cursor: pointer;
+    background: transparent; color: var(--text-dim); border: 1px solid var(--line-bright);
+  }
+  .confirm-card button.yes { color: var(--bg); background: var(--accent); border-color: var(--accent); }
+  .confirm-card.warn button.yes { background: var(--warn); border-color: var(--warn); }
+  .confirm-card .confirm-status { font-size: 12px; color: var(--text-dim); }
+
   /* ============ INPUT BAR (active chat) ============ */
   .input-bar {
     display: flex;
@@ -769,6 +794,56 @@
     entry.appendChild(body);
     log.appendChild(entry);
     log.scrollTop = log.scrollHeight;
+  }
+
+  // ---- Confirmation cards, pushed from Python (UI._ui_confirm) ----
+  // Details come from model-generated tool arguments, so they're only ever
+  // set via textContent, never innerHTML.
+  function showConfirm(req) {
+    enterActiveChat();
+    const card = document.createElement('div');
+    card.className = 'confirm-card' + (req.tier === 'warn' ? ' warn' : '');
+    card.dataset.confirmId = req.id;
+
+    const title = document.createElement('div');
+    title.className = 'confirm-title';
+    title.textContent = req.title;
+    const details = document.createElement('pre');
+    details.className = 'confirm-details';
+    details.textContent = req.details;
+    const actions = document.createElement('div');
+    actions.className = 'confirm-actions';
+    const yes = document.createElement('button');
+    yes.className = 'yes';
+    yes.textContent = 'Yes';
+    const no = document.createElement('button');
+    no.textContent = 'No';
+
+    function answer(ok) {
+      actions.innerHTML = '';
+      const status = document.createElement('span');
+      status.className = 'confirm-status';
+      status.textContent = ok ? 'Approved.' : 'Declined.';
+      actions.appendChild(status);
+      window.pywebview.api.confirm_reply(req.id, ok);
+    }
+    yes.addEventListener('click', () => answer(true));
+    no.addEventListener('click', () => answer(false));
+
+    actions.appendChild(yes);
+    actions.appendChild(no);
+    card.appendChild(title);
+    card.appendChild(details);
+    card.appendChild(actions);
+    log.appendChild(card);
+    log.scrollTop = log.scrollHeight;
+  }
+
+  function expireConfirm(id) {
+    const card = log.querySelector(`[data-confirm-id="${CSS.escape(id)}"]`);
+    if (!card) return;
+    const actions = card.querySelector('.confirm-actions');
+    actions.innerHTML = '<span class="confirm-status">No answer, so nothing was done.</span>';
   }
 
   async function sendMessage(text) {
