@@ -836,6 +836,48 @@ def close_app(app_name: str, force: bool = False) -> str:
             + ". It is probably asking whether to save changes. Tell the owner; force-quit only if they ask.")
 
 
+_start_apps_cache = (0.0, [])
+
+
+def _start_apps() -> list:
+    """[(name, AppID)] for everything in the Start menu, as Windows lists it
+    (Get-StartApps). Includes Microsoft Store apps - WhatsApp, Spotify from
+    the Store - which have no .lnk file for _find_start_menu_shortcut to
+    find. Cached for 10 minutes (the call takes about a second)."""
+    global _start_apps_cache
+    if time.time() - _start_apps_cache[0] < 600 and _start_apps_cache[1]:
+        return _start_apps_cache[1]
+    apps = []
+    try:
+        out = subprocess.run(
+            ["powershell", "-NoProfile", "-NonInteractive", "-Command",
+             "[Console]::OutputEncoding=[Text.Encoding]::UTF8; "
+             "Get-StartApps | ForEach-Object { $_.Name + [char]9 + $_.AppID }"],
+            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=20,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        ).stdout
+        apps = [tuple(line.split("\t", 1)) for line in out.splitlines() if "\t" in line]
+    except Exception as e:
+        print(f"Couldn't list Start menu apps: {e}")
+    _start_apps_cache = (time.time(), apps)
+    return apps
+
+
+def _find_start_app(app_name: str):
+    """(display name, AppID) of the Start menu app best matching app_name:
+    the same name first, then one starting with it, then containing it.
+    "WhatsApp Desktop" / "the Spotify app" match "WhatsApp" / "Spotify"."""
+    want = _squash(re.sub(r"\b(the|desktop|app|application)\b", " ", app_name.lower()))
+    if len(want) < 2:
+        return None
+    apps = [(name, app_id, _squash(name)) for name, app_id in _start_apps()]
+    for test in (lambda n: n == want, lambda n: n.startswith(want), lambda n: len(want) >= 4 and want in n):
+        hits = [(name, app_id) for name, app_id, n in apps if test(n)]
+        if hits:
+            return min(hits, key=lambda h: len(h[0]))   # "WhatsApp" over "WhatsApp Beta"
+    return None
+
+
 def launch_app(app_name: str) -> str:
     """
     Launches an application by name (e.g. "notepad", "chrome", "obsidian")
@@ -862,6 +904,17 @@ def launch_app(app_name: str) -> str:
                 return f"Launched '{app_name}' (via Start Menu shortcut)."
             except Exception as e:
                 return f"Error launching '{app_name}': {e}"
+
+        # Microsoft Store apps have no shortcut file: launch them the way the
+        # Start menu does, by their AppID.
+        start_app = _find_start_app(app_name)
+        if start_app:
+            name, app_id = start_app
+            try:
+                subprocess.Popen(["explorer.exe", f"shell:AppsFolder\\{app_id}"])
+                return f"Launched '{name}' (from the Start menu)."
+            except Exception as e:
+                return f"Error launching '{name}': {e}"
 
         # No shortcut found - fall back to PATH resolution via the shell.
         try:
@@ -2233,6 +2286,7 @@ SAMPLE_RATE = 16000  # Whisper's native input rate - recording at this rate
                       # directly avoids a separate resampling step.
 
 _whisper_model = None
+_whisper_lock = threading.Lock()
 _recording_stream = None
 _recording_frames = []
 
@@ -2242,9 +2296,10 @@ def _get_whisper_model():
     seconds and downloads model weights on first run ever) rather than
     slowing down every ORACLE startup, most of which won't use voice."""
     global _whisper_model
-    if _whisper_model is None:
-        from faster_whisper import WhisperModel
-        _whisper_model = WhisperModel(WHISPER_MODEL_SIZE, device="cpu", compute_type="int8")
+    with _whisper_lock:   # Telegram preloads it in the background; don't load it twice
+        if _whisper_model is None:
+            from faster_whisper import WhisperModel
+            _whisper_model = WhisperModel(WHISPER_MODEL_SIZE, device="cpu", compute_type="int8")
     return _whisper_model
 
 
@@ -3639,6 +3694,8 @@ def active_tools() -> list:
         hidden |= OUTLOOK_TOOLS
     if not os.environ.get("TAVILY_API_KEY"):
         hidden.add("web_search")  # open_web_search still works
+    if not telegram_bot.paired():
+        hidden.add("send_to_my_phone")
     return [t for t in TOOLS if t["function"]["name"] not in hidden]
 
 
@@ -4009,6 +4066,8 @@ TOOL_LABELS = {
 # core/messaging is imported first). Everything it needs is defined by here.
 import messaging  # noqa: E402,F401
 import screen  # noqa: E402,F401  (screen awareness: look_at_screen)
+import memory  # noqa: E402,F401  (long-term memory: remember/forget/recall)
+import telegram_bot  # noqa: E402,F401  (send_to_my_phone)
 
 _tool_listener = None
 
@@ -4026,6 +4085,21 @@ def set_confirm_handler(handler):
     has id, tool, tier, title, details."""
     global _confirm_handler
     _confirm_handler = handler or _terminal_confirm
+
+
+_thread_confirm = threading.local()
+
+
+@contextlib.contextmanager
+def confirm_via(handler):
+    """Approvals for tool calls made on this thread go to handler instead of
+    the global one: a request sent from Telegram is approved on the phone."""
+    previous = getattr(_thread_confirm, "handler", None)
+    _thread_confirm.handler = handler
+    try:
+        yield
+    finally:
+        _thread_confirm.handler = previous
 
 
 # What an unrecognised voice may use without the owner's approval
@@ -4099,7 +4173,7 @@ def execute_tool(fn_map: dict, fn_name: str, raw_args, speaker_verified=None) ->
             "guest": guest,  # spoken "yes" doesn't count for an unrecognised voice
         }
         try:
-            approved = bool(_confirm_handler(request))
+            approved = bool((getattr(_thread_confirm, "handler", None) or _confirm_handler)(request))
         except Exception as e:
             print(f"Confirmation handler failed: {e}")
             approved = False
@@ -4156,15 +4230,18 @@ def run_conversation(user_input: str, history: list, conversation_id: int = None
     saved message to the right thread so it shows up correctly if this
     conversation is reopened later from the sidebar.
 
-    context: a note for this request only (what's on screen); it goes in the
-    in-memory history as a system message but is never saved to the DB.
+    context: a note for this request only (what's on screen, where the
+    request came from); it goes in the in-memory history as a system message
+    but is never saved to the DB. What ORACLE remembers about the owner is
+    added the same way.
     """
-    # Only the latest screen note matters: drop earlier ones.
-    history[:] = [m for i, m in enumerate(history)
-                  if not (i and m.get("role") == "system" and str(m.get("content", "")).startswith("Right now the owner is in"))]
+    # Notes are per request: drop the earlier ones (every system message
+    # after the system prompt itself).
+    history[:] = [m for i, m in enumerate(history) if not (i and m.get("role") == "system")]
     history[:] = trim_history(history)
+    context = (memory.context_line(user_input) + (context or "")).strip()
     if context:
-        history.append({"role": "system", "content": context.strip()})
+        history.append({"role": "system", "content": context})
     user_msg = {"role": "user", "content": user_input}
     history.append(user_msg)
     save_message(user_msg, conversation_id)
