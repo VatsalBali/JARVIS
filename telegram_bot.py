@@ -142,8 +142,15 @@ def send_to_my_phone(text: str) -> str:
     return "Sent to your phone." if send_to_owner(text) else "Error: couldn't reach Telegram."
 
 
+def pairing_code_path() -> str:
+    """The current pairing code, for the owner at the PC (Windows
+    notifications may be switched off). Deleted once paired."""
+    return os.path.join(core._get_data_dir(), "telegram_pairing_code.txt")
+
+
 class TelegramBot:
-    def __init__(self):
+    def __init__(self, on_code=None):
+        self.on_code = on_code       # shows a new pairing code on the PC (the orb's caption)
         self.offset = None
         self.inbox = queue.Queue()
         self.pending = {}            # confirm id -> {"event", "ok", "chat", "message_id", "title"}
@@ -235,6 +242,10 @@ class TelegramBot:
             if secrets.compare_digest(attempt, self.pair_code):
                 core.set_setting("telegram_owner_id", str(user_id))
                 self.pair_code = None
+                try:
+                    os.remove(pairing_code_path())
+                except OSError:
+                    pass
                 send(chat_id, "Paired. You can talk to me here now, by text or voice note.")
                 core.send_notification("ORACLE", "Telegram is linked to ORACLE.")
                 return
@@ -260,8 +271,18 @@ class TelegramBot:
         core.send_notification("ORACLE: link Telegram", f"Code {self.pair_code}. Send it to the bot to link "
                                                         "your Telegram. Didn't ask? Ignore this.")
         print(f"Telegram: pairing code {self.pair_code} (valid 10 minutes)")
+        try:
+            with open(pairing_code_path(), "w") as f:
+                f.write(f"{self.pair_code}\nValid for 10 minutes. Send it to the bot to link your Telegram.\n")
+        except OSError:
+            pass
+        if self.on_code:
+            try:
+                self.on_code(self.pair_code)
+            except Exception:
+                pass
         send(chat_id, "To link this Telegram account to ORACLE, send me the 6-digit code that just "
-                      "appeared on your PC.")
+                      "appeared on your PC (under the orb, and as a notification).")
 
     def _on_button(self, query: dict):
         data = query.get("data") or ""

@@ -384,7 +384,9 @@ class Backend:
 
     def start_telegram(self):
         import telegram_bot
-        bot = telegram_bot.TelegramBot()
+        # The pairing code also goes under the orb: Windows notifications may be off.
+        bot = telegram_bot.TelegramBot(on_code=lambda code: self.emit(
+            {"type": "caption", "text": f"Telegram pairing code: {code}. Send it to your bot."}))
         if bot.start():
             self.telegram = bot
 

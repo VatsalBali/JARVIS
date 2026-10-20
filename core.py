@@ -836,6 +836,48 @@ def close_app(app_name: str, force: bool = False) -> str:
             + ". It is probably asking whether to save changes. Tell the owner; force-quit only if they ask.")
 
 
+_start_apps_cache = (0.0, [])
+
+
+def _start_apps() -> list:
+    """[(name, AppID)] for everything in the Start menu, as Windows lists it
+    (Get-StartApps). Includes Microsoft Store apps - WhatsApp, Spotify from
+    the Store - which have no .lnk file for _find_start_menu_shortcut to
+    find. Cached for 10 minutes (the call takes about a second)."""
+    global _start_apps_cache
+    if time.time() - _start_apps_cache[0] < 600 and _start_apps_cache[1]:
+        return _start_apps_cache[1]
+    apps = []
+    try:
+        out = subprocess.run(
+            ["powershell", "-NoProfile", "-NonInteractive", "-Command",
+             "[Console]::OutputEncoding=[Text.Encoding]::UTF8; "
+             "Get-StartApps | ForEach-Object { $_.Name + [char]9 + $_.AppID }"],
+            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=20,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        ).stdout
+        apps = [tuple(line.split("\t", 1)) for line in out.splitlines() if "\t" in line]
+    except Exception as e:
+        print(f"Couldn't list Start menu apps: {e}")
+    _start_apps_cache = (time.time(), apps)
+    return apps
+
+
+def _find_start_app(app_name: str):
+    """(display name, AppID) of the Start menu app best matching app_name:
+    the same name first, then one starting with it, then containing it.
+    "WhatsApp Desktop" / "the Spotify app" match "WhatsApp" / "Spotify"."""
+    want = _squash(re.sub(r"\b(the|desktop|app|application)\b", " ", app_name.lower()))
+    if len(want) < 2:
+        return None
+    apps = [(name, app_id, _squash(name)) for name, app_id in _start_apps()]
+    for test in (lambda n: n == want, lambda n: n.startswith(want), lambda n: len(want) >= 4 and want in n):
+        hits = [(name, app_id) for name, app_id, n in apps if test(n)]
+        if hits:
+            return min(hits, key=lambda h: len(h[0]))   # "WhatsApp" over "WhatsApp Beta"
+    return None
+
+
 def launch_app(app_name: str) -> str:
     """
     Launches an application by name (e.g. "notepad", "chrome", "obsidian")
@@ -862,6 +904,17 @@ def launch_app(app_name: str) -> str:
                 return f"Launched '{app_name}' (via Start Menu shortcut)."
             except Exception as e:
                 return f"Error launching '{app_name}': {e}"
+
+        # Microsoft Store apps have no shortcut file: launch them the way the
+        # Start menu does, by their AppID.
+        start_app = _find_start_app(app_name)
+        if start_app:
+            name, app_id = start_app
+            try:
+                subprocess.Popen(["explorer.exe", f"shell:AppsFolder\\{app_id}"])
+                return f"Launched '{name}' (from the Start menu)."
+            except Exception as e:
+                return f"Error launching '{name}': {e}"
 
         # No shortcut found - fall back to PATH resolution via the shell.
         try:
