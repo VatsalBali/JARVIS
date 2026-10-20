@@ -35,6 +35,7 @@ CONFIRM_TIMEOUT_SEC = 120          # no answer counts as No, as on the PC
 PAIR_CODE_SEC = 600
 PAIR_MAX_TRIES = 5
 MAX_MESSAGE = 4000                 # Telegram's limit is 4096
+STALE_SEC = 600                    # older messages (sent while ORACLE was off) aren't acted on
 
 CONTEXT = (
     " The owner is messaging you on Telegram from their phone, so they may be away from the PC and "
@@ -69,10 +70,11 @@ _http = requests.Session()
 _http.mount("https://", core._SharedCAAdapter(pool_connections=2, pool_maxsize=4))
 
 
-def _call(method: str, timeout: float = 20, **params):
-    """One Bot API call; returns its result or raises with the token removed."""
+def _call(method: str, http_timeout: float = 20, **params):
+    """One Bot API call; returns its result or raises with the token removed.
+    (http_timeout, not timeout: getUpdates has its own "timeout" parameter.)"""
     try:
-        r = _http.post(f"{API_BASE}/bot{_token()}/{method}", json=params, timeout=timeout)
+        r = _http.post(f"{API_BASE}/bot{_token()}/{method}", json=params, timeout=http_timeout)
         data = r.json()
     except Exception as e:
         raise RuntimeError(f"Telegram {method} failed: {_safe(e)}") from None
@@ -149,6 +151,7 @@ class TelegramBot:
         self.pair_code = None
         self.pair_expires = 0.0
         self.pair_tries = 0
+        self.pair_nagged = 0.0
         self.session = None          # ChatSession for the "Telegram" conversation
         self.bot_name = ""
 
@@ -174,7 +177,7 @@ class TelegramBot:
                 params = {"timeout": POLL_TIMEOUT_SEC, "allowed_updates": ["message", "callback_query"]}
                 if self.offset is not None:
                     params["offset"] = self.offset
-                updates = _call("getUpdates", timeout=POLL_TIMEOUT_SEC + 10, **params)
+                updates = _call("getUpdates", http_timeout=POLL_TIMEOUT_SEC + 10, **params)
                 backoff = 5
                 for update in updates:
                     self.offset = update["update_id"] + 1
@@ -205,6 +208,12 @@ class TelegramBot:
             return
         text = (msg.get("text") or msg.get("caption") or "").strip()
         owner = owner_id()
+        if time.time() - msg.get("date", time.time()) > STALE_SEC:
+            # Sent while ORACLE was off: "play music" or "delete that" hours
+            # later would be a surprise, so ask again rather than act.
+            if owner is not None and sender["id"] == owner:
+                send(chat["id"], f"I was offline when you sent “{text[:60] or 'that'}”. Send it again if you still need it.")
+            return
         if owner is None:
             self._pairing(chat["id"], sender["id"], text)
         elif sender["id"] != owner:
@@ -238,14 +247,16 @@ class TelegramBot:
                 send(chat_id, "That code doesn't match. Check the notification on your PC.")
             return
         if valid:
-            send(chat_id, "Send me the 6-digit code shown on your PC.")
+            if now - self.pair_nagged > 30:   # several "/start"s in a row get one reminder
+                self.pair_nagged = now
+                send(chat_id, "Send me the 6-digit code shown on your PC.")
             return
         if not self.pair_code and now < self.pair_expires:
             send(chat_id, "Too many wrong codes. Try again later.")
             return
         # New code: shown only on the PC, so pairing needs someone at it.
         self.pair_code = f"{secrets.randbelow(10 ** 6):06d}"
-        self.pair_expires, self.pair_tries = now + PAIR_CODE_SEC, 0
+        self.pair_expires, self.pair_tries, self.pair_nagged = now + PAIR_CODE_SEC, 0, now
         core.send_notification("ORACLE: link Telegram", f"Code {self.pair_code}. Send it to the bot to link "
                                                         "your Telegram. Didn't ask? Ignore this.")
         print(f"Telegram: pairing code {self.pair_code} (valid 10 minutes)")
