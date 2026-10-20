@@ -140,7 +140,7 @@ def voice_settings() -> tuple:
     return name, style
 
 
-def _live_config(system_text: str = None) -> dict:
+def _live_config(system_text: str = None, manual_turns: bool = False) -> dict:
     voice, style = voice_settings()
     config = {
         "response_modalities": ["AUDIO"],
@@ -168,6 +168,11 @@ def _live_config(system_text: str = None) -> dict:
             silence_duration_ms=int(core.get_setting("voice_end_silence_ms") or 500),
         )
     )
+    if manual_turns:
+        # Push to talk: the held key marks the owner's turn (activity_start /
+        # activity_end), so pauses while it's held don't end it.
+        config["realtime_input_config"] = types.RealtimeInputConfig(
+            automatic_activity_detection=types.AutomaticActivityDetection(disabled=True))
     return config
 
 

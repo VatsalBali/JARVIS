@@ -57,6 +57,10 @@ ANSWER_WAIT_SEC = 8.0             # after ORACLE asks a question, how long it wa
 LISTEN_MAX_SEC = 45.0             # one request can't hold the mic open longer than this
 FOLLOWUP_SEC = 6.0                # suggested value for the followup_seconds setting (default 0: off)
 STOP_DEBOUNCE_SEC = 0.7
+HOLD_SEC = 0.3                    # hotkey/lens held longer than this: push to talk instead of hands-free
+PTT_TAIL_SEC = 0.15               # keep recording this long after it's let go, for the last word
+PTT_MAX_SEC = 120.0               # one held turn
+PTT_ANSWER_SEC = 20.0             # push to talk: how long ORACLE waits for the next hold after asking a question
 DUCK_LEVEL = 0.3                  # other apps' volume while ORACLE talks
 VOICE_ID_THRESHOLD = 0.75         # cosine similarity; tune via the voice_id_threshold setting
 ENROL_SPEECH_SEC = 25.0
@@ -504,12 +508,22 @@ class Conversation:
     asyncio loop on a worker thread; other threads talk to it via
     barge_in() and end()."""
 
-    def __init__(self, engine, wake_audio: np.ndarray, trusted: bool = False):
+    def __init__(self, engine, wake_audio: np.ndarray, trusted: bool = False, held=None):
         self.engine = engine
         # Started by hotkey/tray: a keypress on this PC is the same proof of
         # presence as clicking Yes, so voice ID isn't needed. Wake-word
         # conversations must pass voice ID for anything personal.
         self.trusted = trusted
+        # Push to talk (hold the hotkey or the chat lens): Gemini's own turn
+        # detection is off and the owner's turn lasts exactly as long as the
+        # hold, so a pause mid-sentence doesn't send it early and the reply
+        # starts the moment they let go. A quick tap stays hands-free.
+        self.held = held              # callable: still held? (None: wake word)
+        self.ptt = False              # decided in run() from how long it's held
+        self.ptt_deciding = held is not None
+        self.ptt_holding = False      # inside a held turn
+        self.ptt_release = False      # let go: the send loop ends the turn
+        self.session = None
         self.emit = engine.emit
         self.mic_q = engine.mic.subscribe(maxsize=200)
         self.wake_audio = wake_audio
@@ -558,6 +572,11 @@ class Conversation:
     def end(self):
         if self.loop:
             self.loop.call_soon_threadsafe(self._end)
+
+    def press(self, held=None):
+        """The talk hotkey or lens was pressed during this conversation."""
+        if self.loop:
+            self.loop.call_soon_threadsafe(self._press, held)
 
     @property
     def speaker_verified_now(self) -> bool:
@@ -614,6 +633,66 @@ class Conversation:
         self.barged = self.mode in ("speaking", "thinking")
         self.drop_audio = self.barged
         self._start_listening()
+
+    def _press(self, held):
+        if self.ptt_deciding or self.ptt_holding:
+            return  # the hotkey auto-repeating while it's held
+        if not self.ptt:
+            self._barge_in()  # hands-free conversation: interrupt and listen, as before
+            return
+        if self.mode in ("thinking", "speaking", "draining"):
+            self._event("barge_in")
+            self._skip_queued_audio()
+            self.barged = self.mode in ("speaking", "thinking")
+            self.drop_audio = self.barged
+        self.held = held or (lambda: False)
+        asyncio.ensure_future(self._guard(self._ptt_begin()))
+
+    async def _ptt_begin(self):
+        """A held turn starts: everything until it's let go is the owner's turn."""
+        self.ptt_holding, self.ptt_release = True, False
+        self.heard_speech = False
+        self.turn_audio = []
+        self.listen_started = time.monotonic()
+        await self.session.send_realtime_input(activity_start=types.ActivityStart())
+        self.sending = True
+        self._set_mode("listening")
+        self.engine.ducker.duck()
+        asyncio.ensure_future(self._guard(self._ptt_watch()))
+
+    async def _ptt_watch(self):
+        while not self.done.is_set() and self.ptt_holding and self.held():
+            await asyncio.sleep(0.03)
+        await asyncio.sleep(PTT_TAIL_SEC)
+        if self.ptt_holding:
+            self.ptt_release = True
+
+    async def _ptt_end(self, session):
+        """Let go: send what's still buffered, then end the owner's turn so
+        Gemini answers straight away."""
+        self.ptt_release = False
+        while True:
+            try:
+                frame = self.mic_q.get_nowait()
+            except queue.Empty:
+                break
+            # Let go before Gemini had connected: all of it is still here.
+            if self.is_speech(frame):
+                self.heard_speech = True
+                self.voiced_audio.append(frame)
+            self.turn_audio.append(frame)
+            await session.send_realtime_input(
+                audio=types.Blob(data=frame.tobytes(), mime_type=f"audio/pcm;rate={RATE}"))
+        self.ptt_holding = False
+        self.sending = False
+        await session.send_realtime_input(activity_end=types.ActivityEnd())
+        self.last_voice_at = time.monotonic()  # reply delay counts from letting go
+        self._event("ptt_release")
+        if not self.heard_speech:
+            self._event("ptt_nothing_said")
+            self._end()  # a tap, or held without speaking: nothing to answer
+            return
+        self._set_mode("thinking")
 
     def _skip_queued_audio(self):
         """Drops unplayed audio and the captions that went with it, keeping
@@ -711,6 +790,9 @@ class Conversation:
 
     async def _send_loop(self, session):
         while not self.done.is_set():
+            if self.ptt_release:
+                await self._ptt_end(session)
+                continue
             try:
                 frame = await asyncio.to_thread(self.mic_q.get, True, 0.2)
             except queue.Empty:
@@ -718,14 +800,15 @@ class Conversation:
             if time.monotonic() < self.ack_until:
                 frame = np.zeros_like(frame)  # our own "Yes, Sir?" coming back through the mic
             voiced = self.is_speech(frame)
-            if self.mode in ("listening", "followup"):
+            # Push to talk waits for the next hold, not for speech, after a question.
+            if self.mode == "listening" or (self.mode == "followup" and not self.ptt):
                 self.turn_audio.append(frame)
                 # Local speech detection: Gemini's transcript only arrives
                 # once the owner stops talking, too late for the timeouts.
                 if voiced:
                     self.voiced_audio.append(frame)
                     self.last_voice_at = time.monotonic()
-                    if self.mode == "followup":
+                    if self.mode == "followup" and not self.ptt:
                         # The owner has started answering: from here it's a
                         # normal request, with the listening limits (a long
                         # dictated email isn't cut off at the follow-up cap).
@@ -739,7 +822,8 @@ class Conversation:
                 # true silence until they speak again. Otherwise a keyboard
                 # click or breath while Gemini prepares its answer counts as
                 # the owner interrupting, and it abandons the reply midway.
-                gated = (self.heard_speech and not voiced
+                # (Not in push to talk: the hold, not silence, ends the turn.)
+                gated = (self.heard_speech and not voiced and not self.ptt
                          and time.monotonic() - self.last_voice_at > GATE_HANGOVER_SEC)
                 if gated:
                     frame = np.zeros_like(frame)
@@ -755,18 +839,19 @@ class Conversation:
             if self.mode in ("speaking", "draining"):
                 self.emit({"type": "level", "value": self.player.level})
                 self._show_captions()
-            if self.mode == "listening" and not self.heard_speech and now - self.listen_started > NO_SPEECH_SEC:
+            holding = self.ptt_holding  # push to talk: the owner decides when the turn ends
+            if self.mode == "listening" and not holding and not self.heard_speech and now - self.listen_started > NO_SPEECH_SEC:
                 self._end()
-            elif self.mode == "listening" and self.heard_speech and now - self.last_voice_at > NO_REPLY_SEC:
+            elif self.mode == "listening" and not holding and self.heard_speech and now - self.last_voice_at > NO_REPLY_SEC:
                 self._end()  # spoke, then silence, and Gemini never answered
-            elif self.mode == "listening" and now - self.listen_started > LISTEN_MAX_SEC:
+            elif self.mode == "listening" and now - self.listen_started > (PTT_MAX_SEC if holding else LISTEN_MAX_SEC):
                 self._event("listen_cap")
                 self._end()  # constant background speech (TV, room) keeps "hearing" someone
             elif (self.mode == "thinking" and not self.tool_running
                     and now - self.last_server_at > NO_REPLY_SEC):
                 self._end()  # waiting on an answer that never came
             elif (self.mode == "draining" and not self.player.busy
-                    and self.followup_sec <= 0 and not self.asked_question):
+                    and (self.followup_sec <= 0 or self.ptt) and not self.asked_question):
                 # One command per wake (the owner's choice): once the reply
                 # has left the device buffer, go back to sleep - unless it
                 # asked a question, which opens the follow-up window below.
@@ -779,16 +864,18 @@ class Conversation:
                 # Reply finished playing: listen for a follow-up without the
                 # wake word. Starting only now keeps ORACLE from hearing itself.
                 self._show_captions(everything=True)
-                self.sending = True
+                self.sending = not self.ptt  # push to talk: the next hold opens the mic
                 self.turn_audio = []
                 self.heard_speech = False
                 self.followup_started = now
                 wait = max(self.followup_sec, ANSWER_WAIT_SEC if self.asked_question else 0)
-                self.followup_until = now + wait
+                self.followup_until = now + (PTT_ANSWER_SEC if self.ptt else wait)
                 if self.asked_question:
                     self._event("awaiting_answer")
                 self.asked_question = False
                 self._set_mode("followup")
+                if self.ptt:
+                    self.emit({"type": "state", "state": "followup", "label": "HOLD TO ANSWER"})
                 self.engine.ducker.restore()
             elif self.mode == "followup" and not self.heard_speech and now > self.followup_until:
                 self._end()
@@ -916,21 +1003,36 @@ class Conversation:
         self.loop = asyncio.get_running_loop()
         self.done = asyncio.Event()
         self.player = Player()
-        self.ack_pending = self.engine.acks.pick()
+        if self.held is not None:
+            # Hotkey or lens: let go quickly and it's hands-free, as with the
+            # wake word; keep holding and it's push to talk. The mic is already
+            # being buffered, so nothing said meanwhile is lost.
+            deadline = time.monotonic() + HOLD_SEC
+            while time.monotonic() < deadline and self.held():
+                await asyncio.sleep(0.02)
+            self.ptt = bool(self.held())
+            self.ptt_deciding = False
+            self._event("push_to_talk" if self.ptt else "tap")
+        # No "Yes, Sir?" while the key is held: the owner is already talking.
+        self.ack_pending = None if self.ptt else self.engine.acks.pick()
         ack_task = asyncio.create_task(self._guard(self._ack_after_pause()))
         # The date and time let "remind me at 6" / "tomorrow" resolve without
         # an extra get_current_time round trip.
         config = gemini_voice._live_config(
             core.SYSTEM_PROMPT + VOICE_STYLE
             + f" The current local date and time is {datetime.now():%A %d %B %Y, %H:%M}."
+            + _memory_context()
             + _message_context()
-            + _screen_context()
+            + _screen_context(),
+            manual_turns=self.ptt,
         )
         self.engine.ducker.duck()
         self._set_mode("listening")
         try:
             async with contextlib.AsyncExitStack() as stack:
-                session = await gemini_voice.connect_live(stack, config)
+                session = self.session = await gemini_voice.connect_live(stack, config)
+                if self.ptt:
+                    await self._ptt_begin()
                 tasks = [
                     asyncio.create_task(self._guard(self._send_loop(session))),
                     asyncio.create_task(self._guard(self._receive_loop(session))),
@@ -967,6 +1069,28 @@ def _chime() -> bytes:
 ACK_PHRASES = ["Yes, Sir?", "Sir?", "At your service.", "I'm listening.", "How can I help?"]
 ACK_LEAD_IN_SEC = 0.25   # silence first, so Bluetooth headphones waking up don't clip it
 ACK_WAIT_SEC = 0.35      # speech within this long after the wake word: no ack, it's the command
+
+
+_VK_CONTROL, _VK_MENU, _VK_O, _VK_SPACE = 0x11, 0x12, 0x4F, 0x20
+
+
+def hotkey_held() -> bool:
+    """Whether the talk hotkey (Ctrl+Alt+O or Ctrl+Alt+Space) is still held.
+    Letting go of any of its keys counts as letting go. The global hotkey
+    swallows the key presses, but Windows still reports the keys as down."""
+    import ctypes
+    state = ctypes.windll.user32.GetAsyncKeyState
+    down = lambda vk: bool(state(vk) & 0x8000)  # noqa: E731
+    return down(_VK_CONTROL) and down(_VK_MENU) and (down(_VK_O) or down(_VK_SPACE))
+
+
+def _memory_context() -> str:
+    """What ORACLE remembers about the owner (README 3.3)."""
+    try:
+        import memory
+        return memory.context_line()
+    except Exception:
+        return ""
 
 
 def _message_context() -> str:
@@ -1154,8 +1278,10 @@ class VoiceEngine:
         if self.muted or self._enrolling or self._confirm_pending:
             return False
         conv = self.conversation
-        # Asleep, or mid-reply (barge-in). Not while already listening.
-        return conv is None or conv.mode in ("thinking", "speaking", "draining")
+        # Asleep, or mid-reply (barge-in). Not while already listening, and not
+        # in push to talk, where the key (not the wake word) starts each turn.
+        return conv is None or (not conv.ptt and not conv.ptt_deciding
+                                and conv.mode in ("thinking", "speaking", "draining"))
 
     def _on_wake(self):
         conv = self.conversation
@@ -1164,22 +1290,24 @@ class VoiceEngine:
             return
         self._start_conversation(self.mic.recent(1.5))
 
-    def trigger(self):
-        """Hotkey / tray / ring click: same as saying the wake word."""
+    def trigger(self, held=None):
+        """Hotkey / tray / chat lens. held() says whether the key or lens is
+        still down: a tap is the same as saying the wake word (hands-free),
+        holding is push to talk - ORACLE listens until it's let go."""
         if self.muted:
             return
         conv = self.conversation
         if conv is not None:
             conv.trusted = True  # the owner pressed the key mid-conversation
-            conv.barge_in()
+            conv.press(held)
         else:
-            self._start_conversation(np.zeros(0, dtype=np.int16), trusted=True)
+            self._start_conversation(np.zeros(0, dtype=np.int16), trusted=True, held=held)
 
-    def _start_conversation(self, wake_audio: np.ndarray, trusted: bool = False):
+    def _start_conversation(self, wake_audio: np.ndarray, trusted: bool = False, held=None):
         if not self.mic.running or not self._busy.acquire(blocking=False):
             return
         self.emit({"type": "state", "state": "wake"})
-        conv = Conversation(self, wake_audio, trusted=trusted)
+        conv = Conversation(self, wake_audio, trusted=trusted, held=held)
         self.conversation = conv
 
         def run():

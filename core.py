@@ -2233,6 +2233,7 @@ SAMPLE_RATE = 16000  # Whisper's native input rate - recording at this rate
                       # directly avoids a separate resampling step.
 
 _whisper_model = None
+_whisper_lock = threading.Lock()
 _recording_stream = None
 _recording_frames = []
 
@@ -2242,9 +2243,10 @@ def _get_whisper_model():
     seconds and downloads model weights on first run ever) rather than
     slowing down every ORACLE startup, most of which won't use voice."""
     global _whisper_model
-    if _whisper_model is None:
-        from faster_whisper import WhisperModel
-        _whisper_model = WhisperModel(WHISPER_MODEL_SIZE, device="cpu", compute_type="int8")
+    with _whisper_lock:   # Telegram preloads it in the background; don't load it twice
+        if _whisper_model is None:
+            from faster_whisper import WhisperModel
+            _whisper_model = WhisperModel(WHISPER_MODEL_SIZE, device="cpu", compute_type="int8")
     return _whisper_model
 
 
@@ -3639,6 +3641,8 @@ def active_tools() -> list:
         hidden |= OUTLOOK_TOOLS
     if not os.environ.get("TAVILY_API_KEY"):
         hidden.add("web_search")  # open_web_search still works
+    if not telegram_bot.paired():
+        hidden.add("send_to_my_phone")
     return [t for t in TOOLS if t["function"]["name"] not in hidden]
 
 
@@ -4009,6 +4013,8 @@ TOOL_LABELS = {
 # core/messaging is imported first). Everything it needs is defined by here.
 import messaging  # noqa: E402,F401
 import screen  # noqa: E402,F401  (screen awareness: look_at_screen)
+import memory  # noqa: E402,F401  (long-term memory: remember/forget/recall)
+import telegram_bot  # noqa: E402,F401  (send_to_my_phone)
 
 _tool_listener = None
 
@@ -4026,6 +4032,21 @@ def set_confirm_handler(handler):
     has id, tool, tier, title, details."""
     global _confirm_handler
     _confirm_handler = handler or _terminal_confirm
+
+
+_thread_confirm = threading.local()
+
+
+@contextlib.contextmanager
+def confirm_via(handler):
+    """Approvals for tool calls made on this thread go to handler instead of
+    the global one: a request sent from Telegram is approved on the phone."""
+    previous = getattr(_thread_confirm, "handler", None)
+    _thread_confirm.handler = handler
+    try:
+        yield
+    finally:
+        _thread_confirm.handler = previous
 
 
 # What an unrecognised voice may use without the owner's approval
@@ -4099,7 +4120,7 @@ def execute_tool(fn_map: dict, fn_name: str, raw_args, speaker_verified=None) ->
             "guest": guest,  # spoken "yes" doesn't count for an unrecognised voice
         }
         try:
-            approved = bool(_confirm_handler(request))
+            approved = bool((getattr(_thread_confirm, "handler", None) or _confirm_handler)(request))
         except Exception as e:
             print(f"Confirmation handler failed: {e}")
             approved = False
@@ -4156,15 +4177,18 @@ def run_conversation(user_input: str, history: list, conversation_id: int = None
     saved message to the right thread so it shows up correctly if this
     conversation is reopened later from the sidebar.
 
-    context: a note for this request only (what's on screen); it goes in the
-    in-memory history as a system message but is never saved to the DB.
+    context: a note for this request only (what's on screen, where the
+    request came from); it goes in the in-memory history as a system message
+    but is never saved to the DB. What ORACLE remembers about the owner is
+    added the same way.
     """
-    # Only the latest screen note matters: drop earlier ones.
-    history[:] = [m for i, m in enumerate(history)
-                  if not (i and m.get("role") == "system" and str(m.get("content", "")).startswith("Right now the owner is in"))]
+    # Notes are per request: drop the earlier ones (every system message
+    # after the system prompt itself).
+    history[:] = [m for i, m in enumerate(history) if not (i and m.get("role") == "system")]
     history[:] = trim_history(history)
+    context = (memory.context_line(user_input) + (context or "")).strip()
     if context:
-        history.append({"role": "system", "content": context.strip()})
+        history.append({"role": "system", "content": context})
     user_msg = {"role": "user", "content": user_input}
     history.append(user_msg)
     save_message(user_msg, conversation_id)

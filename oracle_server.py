@@ -31,7 +31,9 @@ Events from the UI:
     {"type":"cancel"}
     {"type":"open_chat"}
     {"type":"mute","value":true}
-    {"type":"talk"}                                      hotkey / tray (same as the wake word)
+    {"type":"talk"}                                      hotkey / tray: a tap is the same as the wake word;
+                                                         holding the hotkey is push to talk
+    {"type":"talk","hold":true} / {"type":"talk_release"}  chat lens pressed / let go (push to talk)
     {"type":"enroll"}                                    tray "Learn my voice"
     {"type":"call","id":"...","method":"send_message","args":{"text":"hi"}}
 
@@ -72,6 +74,7 @@ RPC_METHODS = {
 
 
 MISSED_REMINDER_HOURS = 12  # older ones missed while ORACLE was off are dropped
+AWAY_SEC = 300              # no keyboard/mouse input for this long: reminders and alerts go to Telegram too
 
 
 def _seconds_since_input() -> float:
@@ -109,6 +112,8 @@ class Backend:
         self._tasks = set()  # in-flight RPC tasks, kept so they aren't garbage-collected
         self.voice = None    # VoiceEngine, started by start_voice()
         self._enroll_after_conversation = False
+        self.telegram = None
+        self._ui_hold = False  # the chat window's lens is being held down (push to talk)
 
         core.set_confirm_handler(self.confirm)
         core.set_tool_listener(lambda name, label: self.emit({"type": "tool", "name": name, "label": label}))
@@ -263,6 +268,7 @@ class Backend:
                     if rid not in announced_toast:
                         core.send_notification(f"ORACLE {title.lower()}", message)
                         announced_toast.add(rid)
+                        self._to_phone_if_away(f"⏰ {title}: {message}")
                     text = _reminder_speech(kind, message, due, late)
                     if self.voice is None or not self.voice.mic.running:
                         core.mark_reminder(rid, "fired")  # no voice: the toast is it
@@ -323,6 +329,7 @@ class Backend:
                 if (core.get_setting("alerts") or "on").lower() == "on":
                     for alert in monitor.check():
                         core.send_notification(f"ORACLE: {alert.title}", alert.body)
+                        self._to_phone_if_away(f"⚠️ {alert.title}: {alert.body}")
                         pending = [a for a in pending if a.key != alert.key] + [alert]
                     now = time.monotonic()
                     pending = [a for a in pending if not a.stale(now)]
@@ -372,6 +379,23 @@ class Backend:
             except Exception as e:
                 print(f"Message check failed: {e}", file=sys.stderr)
             time.sleep(2)
+
+    # ---- Telegram (README 3.8) ----
+
+    def start_telegram(self):
+        import telegram_bot
+        bot = telegram_bot.TelegramBot()
+        if bot.start():
+            self.telegram = bot
+
+    def _to_phone_if_away(self, text: str):
+        """Reminders and alerts reach the owner's phone when they're away from
+        the PC (setting telegram_notify on/off)."""
+        if self.telegram is None or (core.get_setting("telegram_notify") or "on").lower() != "on":
+            return
+        if _seconds_since_input() >= AWAY_SEC:
+            import telegram_bot
+            threading.Thread(target=telegram_bot.send_to_owner, args=(text,), daemon=True).start()
 
     def _may_speak_alert(self, quiet: bool) -> bool:
         """Not in quiet hours, not muted or mid-conversation, and only when the
@@ -448,8 +472,17 @@ class Backend:
                         await asyncio.to_thread(self.voice.set_muted, self.muted)
                     self.emit({"type": "muted", "value": self.muted})
                 elif kind == "talk":
+                    # Tap: hands-free, as with the wake word. Hold: push to
+                    # talk, listening only while the key or lens is held.
+                    if msg.get("hold"):
+                        self._ui_hold = True
+                        held = lambda: self._ui_hold  # noqa: E731
+                    else:
+                        from voice_engine import hotkey_held as held
                     if self.voice:
-                        self.voice.trigger()
+                        self.voice.trigger(held=held)
+                elif kind == "talk_release":
+                    self._ui_hold = False
                 elif kind == "enroll":
                     # From the tray: a click is the owner's authority.
                     if self.voice:
@@ -510,6 +543,7 @@ def main():
             backend.start_briefing()
         backend.start_alerts()
         backend.start_messages()
+        backend.start_telegram()
     try:
         asyncio.run(backend.run())
     except KeyboardInterrupt:

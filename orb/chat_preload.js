@@ -84,7 +84,10 @@ contextBridge.exposeInMainWorld('pywebview', {
     stop_recording: () => call('stop_recording'),
     // Socket messages rather than calls.
     confirm_reply: (id, ok) => send({ type: 'confirm_reply', id, ok: !!ok }),
-    start_voice_turn: () => send({ type: 'talk' }),
+    // Pressing the lens starts a voice turn: a click is hands-free, holding
+    // it is push to talk until end_voice_turn (let go).
+    start_voice_turn: () => send({ type: 'talk', hold: true }),
+    end_voice_turn: () => send({ type: 'talk_release' }),
     // Window and OS dialogs belong to the main process.
     minimize_window: () => ipcRenderer.send('chat-window', 'minimize'),
     toggle_maximize_window: () => ipcRenderer.send('chat-window', 'maximize'),

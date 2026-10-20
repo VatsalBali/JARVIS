@@ -24,7 +24,24 @@
   lens.setState('asleep');
   lens.start();
   window.addEventListener('resize', () => lens.resize());
-  $('orbSlot').addEventListener('click', () => api.start_voice_turn());
+  // Press the lens to talk: click for hands-free, hold to speak until you let go.
+  const slot = $('orbSlot');
+  let holding = false;
+  slot.addEventListener('pointerdown', (e) => {
+    if (e.button !== 0) return;
+    holding = true;
+    slot.setPointerCapture(e.pointerId);  // the release counts even off the lens
+    api.start_voice_turn();
+  });
+  const release = () => {
+    if (!holding) return;
+    holding = false;
+    api.end_voice_turn();
+  };
+  slot.addEventListener('pointerup', release);
+  slot.addEventListener('pointercancel', release);
+  slot.addEventListener('lostpointercapture', release);
+  window.addEventListener('blur', release);
 
   const STATUS = { asleep: 'ONLINE', wake: 'LISTENING', listening: 'LISTENING', thinking: 'THINKING', speaking: 'SPEAKING', followup: 'LISTENING' };
   function setState(state, label) {
@@ -488,7 +505,7 @@
       get_projects_root: () => wait(10, 'D:/code'), list_projects: () => wait(10, [{ name: 'zombie', path: 'D:/code/zombie' }]),
       open_project: () => wait(10, []), choose_projects_root: () => wait(10, null),
       start_recording: () => wait(10), stop_recording: () => wait(10, ''),
-      confirm_reply: () => {}, start_voice_turn: () => setState('listening'),
+      confirm_reply: () => {}, start_voice_turn: () => setState('listening'), end_voice_turn: () => setState('thinking'),
       minimize_window: () => {}, toggle_maximize_window: () => {}, hide_window: () => {},
     };
   }

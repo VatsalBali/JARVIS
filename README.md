@@ -30,13 +30,15 @@ A desktop assistant for Windows modeled on JARVIS from Iron Man. It's calm, dry-
 
 ### Environment variables
 
-`GROQ_API_KEY`, `TAVILY_API_KEY`, `GOOGLE_API_KEY` (Gemini), `MS_CLIENT_ID`, `GOOGLE_CLIENT_SECRET_PATH`. Never hardcode keys. The Google client-secret JSON is gitignored and must stay that way.
+`GROQ_API_KEY`, `TAVILY_API_KEY`, `GOOGLE_API_KEY` (Gemini), `MS_CLIENT_ID`, `GOOGLE_CLIENT_SECRET_PATH`, `TELEGRAM_BOT_TOKEN` (optional, from @BotFather). Never hardcode keys. The Google client-secret JSON is gitignored and must stay that way.
 
 ### Files
 
 ```
 core.py           brain, 33 tools, DB, email/calendar, STT
 gemini_voice.py   ring-click voice turn (Gemini Live)
+memory.py         long-term memory: remember / forget / recall, added to every request
+telegram_bot.py   Telegram bot: talk to ORACLE from the phone, approvals as buttons
 UI.py             pywebview window, JS bridge (Api class), tray, autostart
 index.html        HUD front end
 chat.html         older chat UI
@@ -78,6 +80,7 @@ log_ram.ps1 / register_task.bat   hourly RAM logger (separate utility)
 | Follow-up window: after a reply, keep listening ~6 s without needing "Oracle" again | 🆕 | P1 |
 | Interrupt ORACLE mid-sentence by saying "Oracle" | 🆕 | P2 |
 | Global hotkey to talk (e.g. Ctrl+Space) and to mute the mic | 🆕 | P2 |
+| **Press and hold to speak:** hold Ctrl+Alt+O (or the chat window's lens) and ORACLE listens until you let go; pauses don't end the turn and the reply starts on release. A quick tap stays hands-free | ✅ | P2 |
 | Offline voice fallback (Whisper in, Piper out) when Gemini is unreachable | 🆕 | P3 |
 
 ### 3.3 Memory: *"You asked me to remind you…"*
@@ -85,7 +88,7 @@ log_ram.ps1 / register_task.bat   hourly RAM logger (separate utility)
 |---|---|---|
 | All chats saved and reopenable, pin/rename/delete | ✅ | P1 |
 | Voice and typed turns share one history | ✅ | P1 |
-| Long-term facts about the owner ("remember I prefer…"), recalled automatically | 🆕 | P2 |
+| Long-term facts about the owner ("remember I prefer…"), recalled automatically. Saved from the owner's own words only (never from emails, pages or messages), an unrecognised voice needs approval, passwords/PINs/card numbers refused, forgetting needs approval | ✅ | P2 |
 | Search past conversations ("what did we decide about X last week?") | 🆕 | P2 |
 
 ### 3.4 Diagnostics: *"Power at 400% capacity."* (the suit-status equivalent)
@@ -140,6 +143,7 @@ log_ram.ps1 / register_task.bat   hourly RAM logger (separate utility)
 | **WhatsApp: send.** "Oracle, WhatsApp Mum I'll be late" → finds the contact, drafts the text, reads it back, sends after confirmation (see WhatsApp notes below) | 🆕 | P2 |
 | **WhatsApp: incoming.** Announce new WhatsApp messages through the orb ("Sir, a message from Mum: …"), with a do-not-disturb option | 🆕 | P2 |
 | **WhatsApp: reply.** "Oracle, reply that I'm on my way" to the last announced message | 🆕 | P3 |
+| **Telegram bot:** text or voice-note ORACLE from the phone (same brain and tools), approvals as Yes/No buttons, reminders and alerts forwarded when away from the PC, "send that to my phone". Paired with a code shown on the PC; one owner, everyone else refused | ✅ | P2 |
 
 **WhatsApp notes.** There is no official WhatsApp API for personal accounts. The Business Cloud API needs a separate business number, and unofficial libraries (whatsapp-web.js, Baileys) break WhatsApp's terms and risk a ban on the owner's number. Recommended approach:
 - **Send:** open a prefilled chat through the WhatsApp Desktop deep link (`whatsapp://send?phone=<number>&text=<message>`), then press Send via UI automation (e.g. `pywinauto`) only after the owner confirms. Contacts come from a small local contact list (name → number) that ORACLE manages ("Oracle, save Mum's number").
